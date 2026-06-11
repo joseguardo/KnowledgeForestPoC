@@ -622,6 +622,32 @@ function Tech({ steps, code, codeLabel = "The actual logic, verbatim" }) {
   );
 }
 
+/* A narrated real-world walkthrough: who triggers it, the stage-by-stage
+   lifecycle, and the literal operation that executes. Kept consistent with
+   DEMO_REQUESTS / the deployed SQL so it can never drift from the system. */
+function Lifecycle({ scenario, stages, op, opLabel = "The operation that actually executes" }) {
+  return (
+    <div className="xp-lifecycle">
+      <span className="lab">Real use case — the full lifecycle</span>
+      <p className="scenario">{scenario}</p>
+      <ol className="stages">
+        {stages.map((s, i) => (
+          <li key={i}>
+            <span className="stage">{s.t}</span>
+            <span className="what">{s.d}</span>
+          </li>
+        ))}
+      </ol>
+      {op && (
+        <>
+          <span className="lab op">{opLabel}</span>
+          <pre>{op}</pre>
+        </>
+      )}
+    </div>
+  );
+}
+
 function LinksSection() {
   return (
     <section className="xp-section">
@@ -657,6 +683,47 @@ function LinksSection() {
               why="Demo memo describing Aurora Robotics"
             />
           </div>
+          <Lifecycle
+            scenario={
+              <>
+                An analyst finishes the <strong>Aurora overview memo</strong> and drops it into the
+                data room. The upload tool knows which company the memo belongs to, so the
+                ingestion request carries the link in its own body — nothing is inferred.
+              </>
+            }
+            stages={[
+              {
+                t: "Arrival",
+                d: <>The memo hits <code>POST /functions/v1/ingest-document</code> with a <code>link</code> block naming the target, the relationship and the reason.</>,
+              },
+              {
+                t: "Resolve",
+                d: <><code>target_canonical_key: "demo:aurora-robotics"</code> is looked up on the unique index and lands on Aurora’s card — no scoring, no model, the first waterfall match wins.</>,
+              },
+              {
+                t: "Write",
+                d: <>One row goes into <code>edges</code>: source (the memo), target (Aurora), <code>describes</code>, the why, weight 1.0.</>,
+              },
+              {
+                t: "Guard",
+                d: <>The analyst re-uploads the memo next week — the database’s uniqueness constraint answers <code>already_linked</code>. A second row is impossible by construction.</>,
+              },
+              {
+                t: "Visible",
+                d: <>Anyone opening Aurora’s card now finds the memo among its threads, with the stored reason readable: <em>“Demo memo describing Aurora Robotics.”</em></>,
+              },
+            ]}
+            op={`POST /functions/v1/ingest-document
+{
+  "title": "Aurora Robotics — Overview Memo",
+  "content": "...",
+  "link": {
+    "target_canonical_key": "demo:aurora-robotics",
+    "relationship_type":    "describes",
+    "why": "Demo memo describing Aurora Robotics"
+  }
+}`}
+          />
           <Tech
             steps={[
               <>
@@ -725,6 +792,51 @@ VALUES (:memo_id, :aurora_id, 'describes',
             handling are <strong>the same machinery</strong>, which is why a typo in her name can’t
             produce a second María.
           </p>
+          <Lifecycle
+            scenario={
+              <>
+                The <strong>03:00 nightly fetch</strong> pulls María’s email “Series A follow-up”
+                from the shared inbox. Nobody tagged it, nobody will — the message carries nothing
+                but its own headers and body.
+              </>
+            }
+            stages={[
+              {
+                t: "Signals",
+                d: <>The ingestion reads <code>From: maria@acme.com</code> → candidate <em>“María García” / person</em>; the sender domain → candidate <em>“acme.com” / company</em>.</>,
+              },
+              {
+                t: "Embed",
+                d: <>Each candidate label gets its embedding in the Edge Function, so the next step can compare by meaning as well as spelling.</>,
+              },
+              {
+                t: "Score",
+                d: <><code>check_duplicates()</code> compares each candidate against every same-type card — <code>GREATEST(</code>trigram<code>, </code>cosine<code>)</code>. María’s existing card comes back at ≈ 95%.</>,
+              },
+              {
+                t: "Decide",
+                d: <>95% ≥ the 0.80 merge threshold → the email resolves to the <strong>existing</strong> María. No new card, no second María — ever.</>,
+              },
+              {
+                t: "Write",
+                d: <>Three edges are inserted — <code>sent_by</code>, <code>about</code>, <code>works_at</code> — each with <code>why</code> set to the evidence that resolved it, so the link is auditable later.</>,
+              },
+              {
+                t: "Morning",
+                d: <>Before anyone opens a laptop, the email already sits on Acme’s card, threaded to María — filed by the system, not by a person.</>,
+              },
+            ]}
+            op={`-- per candidate signal, inside check_duplicates():
+SELECT GREATEST(similarity(p.label, 'María García'),
+                1.0 - (p.embedding <=> :emb)) AS score
+FROM pointers p WHERE p.type = 'person'
+ORDER BY score DESC LIMIT 10;          -- → 0.95, merge
+
+-- then, one edge per recognized signal:
+INSERT INTO edges (source_id, target_id, relationship_type, why, weight)
+VALUES (:email_id, :maria_id, 'sent_by',
+        'From: header — maria@acme.com', 1.0);`}
+          />
           <Tech
             steps={[
               <>
@@ -791,6 +903,44 @@ ORDER BY score DESC LIMIT 10;
               why="Attachment hash equals the document’s fingerprint"
             />
           </div>
+          <Lifecycle
+            scenario={
+              <>
+                Last week an associate uploaded <strong>deck_v3.pdf</strong> to the data room.
+                Tonight María’s email arrives carrying the same file as an attachment — different
+                route, different filename casing, same bytes.
+              </>
+            }
+            stages={[
+              {
+                t: "Fingerprint",
+                d: <>The attachment is ingested like any document: <code>sha256(content)</code> becomes its <code>canonical_key</code> — <code>doc:4b4999…</code>. Identity comes from the bytes, not the filename.</>,
+              },
+              {
+                t: "Collide",
+                d: <>That hash already exists — the unique index hits last week’s upload, and <code>check_duplicates()</code> returns <code>exact_canonical</code> at 100%.</>,
+              },
+              {
+                t: "Merge",
+                d: <>The copy merges into the existing document: <code>chunks_inserted: 0</code>, nothing stored twice, nothing re-embedded.</>,
+              },
+              {
+                t: "Link",
+                d: <>The email simply links to the pointer its attachment resolved to. No similarity score was ever involved — zero false positives by construction.</>,
+              },
+              {
+                t: "Discovery",
+                d: <>The data-room upload and the email thread are now connected <strong>through the one document</strong> — a link nobody declared and nobody had to notice.</>,
+              },
+            ]}
+            op={`POST /functions/v1/ingest-document        // the attachment, as-is
+{ "title": "deck_v3.pdf", "content": "..." }
+
+-> { "status": "merged",                   // recognized by fingerprint
+     "canonical_key": "doc:4b4999…",
+     "chunks_inserted": 0 }                // nothing stored twice
+-- the email then links to that resolved pointer_id`}
+          />
           <Tech
             steps={[
               <>
@@ -845,6 +995,43 @@ ORDER BY score DESC LIMIT 10;
               why="Visited together in 9 research sessions this month — your team’s pattern, invisible to other tenants"
             />
           </div>
+          <Lifecycle
+            scenario={
+              <>
+                For two weeks, three analysts working the <strong>Acme deal</strong> keep opening
+                the same things in the same research sessions: Acme’s card, then the EU AI Act,
+                then the deck. Nobody files anything — they’re just working.
+              </>
+            }
+            stages={[
+              {
+                t: "Paths",
+                d: <>Each session’s visited cards form a path. After 30 idle seconds it flushes to <code>query_paths</code> — with an <code>agent_id</code> when the visitor was an agent, not a person.</>,
+              },
+              {
+                t: "Weights",
+                d: <>Every pair in a path scores <code>1 / distance</code> — neighbors 1.0, two-apart 0.5 — accumulated per tenant into <code>tenant_coaccess</code>. (Acme, EU AI Act) climbs a little with every session.</>,
+              },
+              {
+                t: "Threshold",
+                d: <>Around the ninth session the pair crosses weight 2.0 — enough signal to be trusted as structure, not coincidence.</>,
+              },
+              {
+                t: "Nightly",
+                d: <>The night cycle runs Union-Find over all heavy pairs: the cluster becomes a branch, an LLM names it from its members, and Jaccard &gt; 0.3 maps it onto the existing tree — the forest evolves, it doesn’t reset.</>,
+              },
+              {
+                t: "Morning",
+                d: <>Acme and the EU AI Act now share a branch, joined by a <code>co_access · 6.5</code> edge whose why reads like a sentence — a link drawn purely from how your team works, invisible to every other tenant.</>,
+              },
+            ]}
+            op={`path:  [acme, eu-ai-act, deck_v3]        // one session, flushed
+pairs: (acme, eu-ai-act) +1.0  (acme, deck_v3) +0.5
+       -> tenant_coaccess.weight  ...session after session...
+
+nightly: weight >= 2.0 -> Union-Find -> branch
+         -> LLM names it -> Jaccard > 0.3 keeps continuity`}
+          />
           <Tech
             steps={[
               <>
@@ -900,6 +1087,22 @@ nightly: weight >= 2.0 -> Union-Find -> branches
 
 /* ── Retrieval: the five methods, with exact mechanics ────────────── */
 
+function RetrievalExample({ ask, get }) {
+  return (
+    <div className="xp-rexample">
+      <span className="lab">Worked example</span>
+      <div className="row">
+        <span className="dir">The request</span>
+        <span className="val">{ask}</span>
+      </div>
+      <div className="row">
+        <span className="dir">The result</span>
+        <span className="val">{get}</span>
+      </div>
+    </div>
+  );
+}
+
 function RetrievalSection() {
   return (
     <section className="xp-section">
@@ -926,6 +1129,44 @@ function RetrievalSection() {
             inside Postgres and return ranked cards in milliseconds — <strong>no language model,
             no embedding call</strong>, and therefore no latency and no per-query cost.
           </p>
+          <RetrievalExample
+            ask={<>Typing <code>auro</code> — four letters, mid-word.</>}
+            get={<><strong>Aurora Robotics</strong> · company, ranked first. Trigram matching lands the partial word before you finish typing, and the result arrives with its place in your team’s trees.</>}
+          />
+          <Lifecycle
+            scenario={
+              <>
+                An analyst is <strong>on a live call</strong> — the founder just mentioned a
+                comparable company. She needs Aurora’s card before the sentence ends, so she types
+                <code>auro</code> into the search bar.
+              </>
+            }
+            stages={[
+              {
+                t: "Keystroke",
+                d: <>Every keystroke fires the query as typed — <code>a</code>, <code>au</code>, <code>aur</code>, <code>auro</code>. Responses that arrive after a newer keystroke are discarded client-side, so results never flicker backwards.</>,
+              },
+              {
+                t: "Match",
+                d: <>Inside Postgres, full-text search and trigram similarity run together over indexed columns — <code>auro</code> matches mid-word, a typo would too.</>,
+              },
+              {
+                t: "Frame",
+                d: <>Each hit comes back with its position in the team’s trees, so she sees not just <em>Aurora Robotics</em> but where it lives in the structure she already navigates.</>,
+              },
+              {
+                t: "Render",
+                d: <>Ranked cards in milliseconds. No model was called, no embedding computed — the marginal cost of her search is $0, however many times she does this today.</>,
+              },
+            ]}
+            op={`supabase.rpc("search_hierarchy_aware", {
+  p_query:       "auro",     // the text, exactly as typed
+  p_tenant_id:   tenantId,   // framed in her team's trees
+  p_embedding:   null,       // no model on the hot path
+  p_type_filter: null,
+  p_limit:       15,
+})`}
+          />
           <Tech
             steps={[
               <>
@@ -968,6 +1209,48 @@ function RetrievalSection() {
             <strong>same answer, byte for byte</strong>, which is what makes the output safe to
             build reports on.
           </p>
+          <RetrievalExample
+            ask={<>A weekly report calls: type <code>company</code> · attribute <code>Stage = "Series A"</code> · this quarter’s date window.</>}
+            get={<>The same ordered list on every run — <strong>Aurora Robotics</strong> first, then its peers by relevance and date. Run it twice: byte-identical, until the data itself changes.</>}
+          />
+          <Lifecycle
+            scenario={
+              <>
+                Every <strong>Monday at 08:00</strong> a scheduled job builds the Series A pipeline
+                review that lands in the partners’ inboxes. No human types anything — the job has
+                been sending the identical request for months.
+              </>
+            }
+            stages={[
+              {
+                t: "Trigger",
+                d: <>The cron fires and assembles its fixed request: type <code>company</code>, attribute <code>Stage = "Series A"</code>, this quarter’s date window.</>,
+              },
+              {
+                t: "Narrow",
+                d: <>Structured filters cut the candidate set first — wrong types, wrong stages and out-of-window rows never reach scoring.</>,
+              },
+              {
+                t: "Rank",
+                d: <>What remains is scored three ways and summed — words (<code>ts_rank</code>), spelling (trigram), meaning (cosine). Terms not in play contribute exactly zero.</>,
+              },
+              {
+                t: "Order",
+                d: <>Relevance, then event date, then id — a total ordering with no possible ties, so page 2 next Monday starts exactly where page 1 ended.</>,
+              },
+              {
+                t: "Deliver",
+                d: <>The JSON is <strong>byte-identical</strong> to last week’s unless the data itself changed — which is precisely what lets the report diff “what’s new this week” with confidence.</>,
+              },
+            ]}
+            op={`supabase.rpc("search_pointers", {
+  p_types:        ["company"],
+  p_attr_filters: { "Stage": "Series A" },
+  p_date_from:    "2026-04-01",
+  p_date_to:      "2026-06-30",
+  p_limit:        100,
+})   // same request -> same bytes, every run`}
+          />
           <Tech
             steps={[
               <>
@@ -1013,6 +1296,43 @@ ORDER BY rank DESC NULLS LAST, event_time DESC, id
             “logistics robots” share almost no words — but their embeddings sit close together, so
             a search for one finds the other.
           </p>
+          <RetrievalExample
+            ask={<>Searching <code>logistics robots</code>.</>}
+            get={<><strong>Aurora Robotics</strong> — its memo says “autonomous warehouse robots”. Not one word in common with the query, but the embeddings sit close, so it ranks on top.</>}
+          />
+          <Lifecycle
+            scenario={
+              <>
+                A partner heard a pitch yesterday about <strong>“logistics robots”</strong> and
+                wants to know if the firm has seen anything similar. He searches that exact
+                phrase — which appears in no card, no memo, no email anywhere in memory.
+              </>
+            }
+            stages={[
+              {
+                t: "Embed",
+                d: <>The query text is embedded once — 1,536 numbers placing “logistics robots” in meaning-space. This is the only model cost of the whole search.</>,
+              },
+              {
+                t: "Neighbor",
+                d: <>The pgvector HNSW index walks straight to the nearest stored vectors — no row scan. Every card and chunk vector was already written at ingest, so nothing else is computed now.</>,
+              },
+              {
+                t: "Score",
+                d: <><code>1 - (embedding &lt;=&gt; query)</code> turns distance into a similarity score and merges it into the ranking alongside any text terms in play.</>,
+              },
+              {
+                t: "Land",
+                d: <>Aurora’s memo chunk — <em>“autonomous warehouse robots for mid-size logistics operators”</em> — sits close in meaning-space and surfaces first. Zero words in common with the query; the partner finds the company anyway.</>,
+              },
+            ]}
+            op={`supabase.rpc("search_pointers", {
+  p_query_text: "logistics robots",
+  p_embedding:  embed("logistics robots"),  // 1,536-dim, one call
+})
+-- inside: 1 - (p.embedding <=> p_embedding) joins the rank;
+-- card + chunk vectors were written at ingest, reused here`}
+          />
           <Tech
             steps={[
               <>
@@ -1058,6 +1378,54 @@ ORDER BY rank DESC NULLS LAST, event_time DESC, id
             same filtered search</strong> a system would send, and returns its plan alongside the
             answer so the reasoning is auditable.
           </p>
+          <RetrievalExample
+            ask={<>Asking <code>Which companies are in cybersecurity?</code> — plain language, no filters.</>}
+            get={<>The plan it compiled (<code>{`{ types: ["company"], text: "cybersecurity" }`}</code>), the matching cards with their attributes, and a composed answer naming each company — with the cards it drew from cited.</>}
+          />
+          <Lifecycle
+            scenario={
+              <>
+                An associate preparing for Monday’s pipeline meeting asks the assistant{" "}
+                <strong>“Which companies are in cybersecurity?”</strong> — plain language, no
+                filters, no knowledge of the schema. She needs an answer she can repeat in the
+                meeting and defend if questioned.
+              </>
+            }
+            stages={[
+              {
+                t: "Ask",
+                d: <>Her words go to <code>POST /functions/v1/query-knowledge</code> — nothing else. No filters, no types, no SQL.</>,
+              },
+              {
+                t: "Plan",
+                d: <>One model call compiles the question into the same filtered-search contract a system would send — <code>{`{ types: ["company"], text: "cybersecurity" }`}</code>. The plan is kept, not discarded.</>,
+              },
+              {
+                t: "Execute",
+                d: <>The plan runs against three layers of memory: card labels (text and meaning), attributes (exact facts), and document chunks (paragraph-level content).</>,
+              },
+              {
+                t: "Traverse",
+                d: <>From the matched cards, edges pull connected context — sectors, people, memos — each hop carrying its stored <code>why</code>.</>,
+              },
+              {
+                t: "Compose",
+                d: <>A second model call writes the answer strictly from the retrieved results, citing the cards it used. If memory doesn’t contain it, the answer says so — it never invents.</>,
+              },
+              {
+                t: "Audit",
+                d: <>The response carries <code>plan</code>, <code>results</code> and <code>answer</code> side by side. When a partner asks “where did that come from?”, she can show exactly how the question was interpreted — total cost ≈ $0.0004.</>,
+              },
+            ]}
+            op={`POST /functions/v1/query-knowledge
+{ "query": "Which companies are in cybersecurity?",
+  "mode": "answer" }
+
+-> { "plan": {...},      // how it read the question
+     "results": [...],   // the cards it found
+     "answer": "...",    // composed only from those
+     "result_count": 3 }`}
+          />
           <Tech
             steps={[
               <>
@@ -1107,6 +1475,44 @@ ORDER BY rank DESC NULLS LAST, event_time DESC, id
             following threads to <strong>connected context</strong>, and descending into documents
             to return <strong>the exact paragraph</strong> rather than “see the PDF”.
           </p>
+          <RetrievalExample
+            ask={<>Asking <code>What revenue did Aurora report?</code></>}
+            get={<>The exact Financials paragraph from the overview memo — <strong>“Revenue reached $2M with a pipeline of 14 pilot deployments…”</strong> — plus the thread that connects it: memo → <em>describes</em> → Aurora Robotics.</>}
+          />
+          <Lifecycle
+            scenario={
+              <>
+                During diligence someone asks <strong>“What revenue did Aurora report?”</strong>.
+                The answer exists nowhere as a card or attribute — it lives in one paragraph of a
+                ten-page memo that nobody wants to reopen and skim.
+              </>
+            }
+            stages={[
+              {
+                t: "Match",
+                d: <>The question’s embedding lands on the memo’s <em>Financials</em> chunk — chunks carry their own vectors, so the hit is the paragraph itself, not the whole document.</>,
+              },
+              {
+                t: "Ascend",
+                d: <>The chunk’s parent pointer identifies the full memo — both granularities were written by the same ingestion, so paragraph and document are never out of sync.</>,
+              },
+              {
+                t: "Traverse",
+                d: <>One indexed read of <code>edges</code> follows memo → <em>describes</em> → Aurora Robotics, the stored <code>why</code> riding along — no inference, just a lookup.</>,
+              },
+              {
+                t: "Return",
+                d: <>The answer is the exact paragraph — <em>“Revenue reached $2M with a pipeline of 14 pilot deployments…”</em> — grounded by the thread that ties it to Aurora. Not “see the PDF”.</>,
+              },
+            ]}
+            op={`-- the chunk that answers, then its surroundings: two reads
+SELECT heading, content FROM document_chunks
+ORDER BY embedding <=> :question_embedding LIMIT 3;
+
+SELECT e.relationship_type, e.why, p.label
+FROM edges e JOIN pointers p ON p.id = e.target_id
+WHERE e.source_id = :memo_id;   -- describes -> Aurora Robotics`}
+          />
           <Tech
             steps={[
               <>
@@ -1768,8 +2174,48 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
             <h2 className="xp-h2">Everything meets at the entity</h2>
             <p className="xp-lead">
               A deck and an email never link to each other directly — they both point at{" "}
-              <strong>Acme</strong>. That single meeting point is why nothing gets lost.
+              <strong>Acme</strong>. That single meeting point is why nothing gets lost. An entity
+              is <strong>anything worth remembering exactly once</strong> — and whatever its type,
+              it is the same kind of card underneath: a label, typed attributes, an embedding, and
+              the threads that connect it.
             </p>
+            <div className="xp-anatomy" style={{ marginTop: 0 }}>
+              <span className="lab">Live in this PoC</span>
+              <span className="field">company · Acme Corp</span>
+              <span className="field">person · María García</span>
+              <span className="field">document · deck_v3.pdf</span>
+              <span className="field">email · “Series A follow-up”</span>
+              <span className="field">sector · Cybersecurity</span>
+              <span className="field">geography · Madrid</span>
+              <span className="field">regulation · EU AI Act</span>
+            </div>
+            <div className="xp-anatomy" style={{ marginTop: 10, marginBottom: 22 }}>
+              <span className="lab">And the type system is open</span>
+              <span className="field">deal</span>
+              <span className="field">investment round</span>
+              <span className="field">fund</span>
+              <span className="field">LP</span>
+              <span className="field">term sheet</span>
+              <span className="field">contract</span>
+              <span className="field">board seat</span>
+              <span className="field">meeting</span>
+              <span className="field">note</span>
+              <span className="field">task</span>
+              <span className="field">team</span>
+              <span className="field">technology</span>
+              <span className="field">product</span>
+              <span className="field">market</span>
+              <span className="field">event</span>
+              <span className="field">news item</span>
+              <span className="field">data source</span>
+              <span className="field">agent</span>
+              <span className="field">metric series</span>
+              <span className="field">thesis</span>
+              <span style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
+                — a type earns its place when its attributes or retrieval behavior genuinely
+                differ; otherwise it’s an attribute on an existing card.
+              </span>
+            </div>
             <ul className="xp-points">
               <li>
                 <span className="tick">✓</span>
