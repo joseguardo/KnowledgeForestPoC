@@ -2,7 +2,7 @@
  * Deterministic naming for branches and trees based on member pointer labels/types.
  * No LLM needed — uses heuristics.
  */
-import { POINTER_MAP } from "./knowledgeGraph";
+import { POINTER_MAP } from "./demoGraph.js";
 
 function mode(arr) {
   const counts = {};

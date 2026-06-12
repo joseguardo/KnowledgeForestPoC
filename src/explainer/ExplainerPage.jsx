@@ -144,44 +144,66 @@ function shortId(id) {
 
 /* ── Hero: the memory at a glance ─────────────────────────────────── */
 function HeroGraph() {
+  /* Geometry is computed, not eyeballed: hub at (380,150) r=42, four
+     satellites r=26 placed symmetrically at (±230,±86) from the hub.
+     Edges are trimmed to the circle boundaries (with clearance for the
+     ±6px float animation) so the dashes never pierce a node, and each
+     edge points along its relationship's real direction. */
+  const HUB = { x: 380, y: 150, r: 42 };
+  const SAT_R = 26;
+  const HUB_GAP = 10; // edge starts this far off the hub's rim
+  const SAT_GAP = 14; // and ends this far off the satellite's rim (float headroom)
+
+  const sats = [
+    { x: 150, y: 64,  float: "xp-float-a", avatar: "DOC", label: "Series A deck",  rel: "describes",       toHub: true },
+    { x: 610, y: 64,  float: "xp-float-b", avatar: "MG",  label: "María García",   rel: "CEO of",          toHub: true },
+    { x: 150, y: 236, float: "xp-float-c", avatar: "@",   label: "Email thread",   rel: "12 emails about", toHub: true },
+    { x: 610, y: 236, float: "xp-float-a", avatar: "SEC", label: "Cybersecurity",  rel: "operates in",     toHub: false },
+  ];
+
+  const edges = sats.map((s) => {
+    const dx = s.x - HUB.x, dy = s.y - HUB.y;
+    const len = Math.hypot(dx, dy);
+    const ux = dx / len, uy = dy / len;
+    const hub = { x: HUB.x + ux * (HUB.r + HUB_GAP), y: HUB.y + uy * (HUB.r + HUB_GAP) };
+    const sat = { x: s.x - ux * (SAT_R + SAT_GAP), y: s.y - uy * (SAT_R + SAT_GAP) };
+    // arrow follows the relationship: satellite -> hub, except "operates in"
+    const [from, to] = s.toHub ? [sat, hub] : [hub, sat];
+    return { from, to, mid: { x: (hub.x + sat.x) / 2, y: (hub.y + sat.y) / 2 }, rel: s.rel };
+  });
+
   return (
     <svg className="xp-herograph" viewBox="0 0 760 300" fill="none" aria-hidden="true">
-      <line className="edge" x1="380" y1="150" x2="150" y2="70" />
-      <line className="edge" x1="380" y1="150" x2="610" y2="64" />
-      <line className="edge" x1="380" y1="150" x2="130" y2="232" />
-      <line className="edge" x1="380" y1="150" x2="624" y2="230" />
+      <defs>
+        <marker id="xp-hero-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1 1l6 3-6 3" fill="none" stroke="#c8c8cd" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+        </marker>
+      </defs>
 
-      <text className="edge-label" x="248" y="98">describes</text>
-      <text className="edge-label" x="488" y="96">CEO of</text>
-      <text className="edge-label" x="234" y="208">12 emails about</text>
-      <text className="edge-label" x="492" y="206">operates in</text>
+      {edges.map((e) => (
+        <line key={e.rel} className="edge" x1={e.from.x} y1={e.from.y} x2={e.to.x} y2={e.to.y} markerEnd="url(#xp-hero-arrow)" />
+      ))}
+
+      {edges.map((e) => (
+        <text key={e.rel} className="edge-label" x={e.mid.x} y={e.mid.y} textAnchor="middle" dominantBaseline="central">
+          {e.rel}
+        </text>
+      ))}
 
       <g className="node">
-        <circle cx="380" cy="150" r="42" fill="#16181d" />
-        <text className="node-label" x="380" y="148" textAnchor="middle" fill="#fff">Acme</text>
-        <text className="node-sub" x="380" y="164" textAnchor="middle" fill="rgba(255,255,255,0.7)">one card</text>
+        <circle cx={HUB.x} cy={HUB.y} r={HUB.r + 9} fill="none" stroke="#e4e4e7" strokeDasharray="2 5" />
+        <circle cx={HUB.x} cy={HUB.y} r={HUB.r} fill="#16181d" />
+        <text className="node-label" x={HUB.x} y={HUB.y - 2} textAnchor="middle" style={{ fill: "#fff" }}>Acme</text>
+        <text className="node-sub" x={HUB.x} y={HUB.y + 14} textAnchor="middle" style={{ fill: "rgba(255,255,255,0.72)" }}>one card</text>
       </g>
 
-      <g className="node xp-float-a">
-        <circle cx="150" cy="70" r="26" fill="#fafafa" stroke="#e4e4e7" />
-        <text className="avatar" x="150" y="74" textAnchor="middle">DOC</text>
-        <text className="node-label" x="150" y="114" textAnchor="middle">Series A deck</text>
-      </g>
-      <g className="node xp-float-b">
-        <circle cx="610" cy="64" r="26" fill="#fafafa" stroke="#e4e4e7" />
-        <text className="avatar" x="610" y="68" textAnchor="middle">MG</text>
-        <text className="node-label" x="610" y="108" textAnchor="middle">María García</text>
-      </g>
-      <g className="node xp-float-c">
-        <circle cx="130" cy="232" r="26" fill="#fafafa" stroke="#e4e4e7" />
-        <text className="avatar" x="130" y="236" textAnchor="middle">@</text>
-        <text className="node-label" x="130" y="276" textAnchor="middle">Email thread</text>
-      </g>
-      <g className="node xp-float-a">
-        <circle cx="624" cy="230" r="26" fill="#fafafa" stroke="#e4e4e7" />
-        <text className="avatar" x="624" y="234" textAnchor="middle">SEC</text>
-        <text className="node-label" x="624" y="274" textAnchor="middle">Cybersecurity</text>
-      </g>
+      {sats.map((s) => (
+        <g key={s.label} className={`node ${s.float}`}>
+          <circle cx={s.x} cy={s.y} r={SAT_R} fill="#fafafa" stroke="#e4e4e7" />
+          <text className="avatar" x={s.x} y={s.y + 4} textAnchor="middle">{s.avatar}</text>
+          <text className="node-label" x={s.x} y={s.y + SAT_R + 18} textAnchor="middle">{s.label}</text>
+        </g>
+      ))}
     </svg>
   );
 }
@@ -338,6 +360,11 @@ function CrmDemo({ onWrite }) {
           { k: "HQ", v: "Lisbon", cls: "" },
         ];
 
+  // The structured CRM record, read from the exact request being sent —
+  // the card can never show a value the call doesn't carry.
+  const affinity = (step >= 2 ? DEMO_REQUESTS.crmEnrich : DEMO_REQUESTS.crmCreate)
+    .body.attributes.find((a) => a.key === "Affinity").value;
+
   const loading = create.loading || enrich.loading;
   const lastResult = enrich.result || create.result;
   const lastError = enrich.error || create.error;
@@ -356,12 +383,26 @@ function CrmDemo({ onWrite }) {
           {step === 0 ? (
             <div className="xp-crm-row"><span className="k" style={{ color: "#b3b8c2" }}>not in memory yet</span></div>
           ) : (
-            rows.map((r) => (
-              <div key={r.k} className={`xp-crm-row ${r.cls}`}>
-                <span className="k">{r.k}</span>
-                <span className="v">{r.v}</span>
+            <>
+              {rows.map((r) => (
+                <div key={r.k} className={`xp-crm-row ${r.cls}`}>
+                  <span className="k">{r.k}</span>
+                  <span className="v">{r.v}</span>
+                </div>
+              ))}
+              <div className="xp-crm-json">
+                <div className="head">
+                  <span className="k">Affinity</span>
+                  <span className="tag">one attribute · whole record</span>
+                </div>
+                {Object.entries(affinity).map(([k, v]) => (
+                  <div key={k} className={`sub ${step >= 2 && (k === "funnel_stage" || k === "ic_date") ? "changed" : ""}`}>
+                    <span className="sk">{k}</span>
+                    <span className="sv">{v}</span>
+                  </div>
+                ))}
               </div>
-            ))
+            </>
           )}
         </div>
       </div>
@@ -396,8 +437,8 @@ function CrmDemo({ onWrite }) {
           label={step === 0 ? "What button 1 actually sends" : "What button 2 actually sends"}
           note={
             step === 0
-              ? "Note the canonical_key — the company's official ID inside the memory."
-              : "Same canonical_key, new values: Revenue changed, Stage is new. The system resolves the rest."
+              ? "Note the canonical_key — the company's official ID inside the memory — and the Affinity attribute: a whole CRM record carried as one structured value, next to flat facts like Revenue."
+              : "Same canonical_key, new values: Revenue changed, Stage is new — and inside the Affinity record, the deal moved up the funnel to Investment Committee. The system resolves the rest."
           }
         />
 
@@ -410,7 +451,11 @@ function CrmDemo({ onWrite }) {
             </div>
             <ul className="xp-facts">
               {lastResult.status === "created" && (
-                <li><strong>New card created.</strong> Aurora Robotics is now in memory with 2 facts.</li>
+                <li>
+                  <strong>New card created.</strong> Aurora Robotics is now in memory with 3
+                  attributes — two flat facts and one structured record (the Affinity JSON), stored
+                  side by side on the same card.
+                </li>
               )}
               {lastResult.status === "merged" && (
                 <>
@@ -422,8 +467,9 @@ function CrmDemo({ onWrite }) {
                     )}
                   </li>
                   <li>
-                    <strong>{lastResult.enriched_attributes ?? 0} facts enriched</strong> on the existing card — Revenue
-                    updated, Stage added. No duplicate created.
+                    <strong>{lastResult.enriched_attributes ?? 0} attributes enriched</strong> on the existing card —
+                    Revenue updated, Stage added, and the Affinity record advanced to{" "}
+                    <strong>Investment Committee</strong>. No duplicate created.
                   </li>
                 </>
               )}
@@ -2009,14 +2055,11 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
       <header className="xp-topbar">
         <div className="brand">
           <span className="logomark">K</span>
-          Knowledge Forest
+          Memory Layer
         </div>
         <nav>
           <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onRunDemo}>
             Watch it grow
-          </button>
-          <button className="xp-btn primary" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onEnterForest}>
-            Enter the forest
           </button>
         </nav>
       </header>
@@ -2036,9 +2079,6 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
             how you actually work. Every example below runs against the <strong>live system</strong>.
           </p>
           <div className="xp-cta-row">
-            <button className="xp-btn primary" onClick={onEnterForest}>
-              Enter the live forest →
-            </button>
             <a className="xp-btn ghost" href="#inspiration" style={{ textDecoration: "none", display: "inline-block" }}>
               How it works ↓
             </a>
@@ -2113,8 +2153,18 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
               <li>
                 <span className="tick">✓</span>
                 <span>
+                  <strong>Structured and unstructured, side by side.</strong> A flat fact like{" "}
+                  <em>Revenue</em> and a whole CRM record — name, URL, who introduced the deal,
+                  where it sits in the funnel — live as attributes on the same card. The{" "}
+                  <em>Affinity</em> attribute below carries the entire record as one JSON value.
+                </span>
+              </li>
+              <li>
+                <span className="tick">✓</span>
+                <span>
                   <strong>Editable, with provenance.</strong> Every fact remembers where it came
-                  from and when it was last touched.
+                  from and when it was last touched — the Affinity record arrives tagged{" "}
+                  <code className="xp-inlinecode">source: "affinity"</code>.
                 </span>
               </li>
               <li>

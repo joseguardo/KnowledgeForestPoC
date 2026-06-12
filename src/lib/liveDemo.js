@@ -40,6 +40,21 @@ export const DEMO_REQUESTS = {
       attributes: [
         { key: "Revenue", value: "$1M", sort_order: 1 },
         { key: "HQ", value: "Lisbon", sort_order: 2 },
+        {
+          // One attribute, one whole CRM record: structured, use-case-specific
+          // state lives side by side with flat facts on the same card.
+          key: "Affinity",
+          data_type: "json",
+          source: "affinity",
+          sort_order: 4,
+          value: {
+            name: "Aurora Robotics",
+            url: "https://aurorarobotics.eu",
+            source: "Intro — María García (Acme Corp)",
+            funnel_stage: "Screening",
+            owner: "deal-team",
+          },
+        },
       ],
     },
   },
@@ -52,6 +67,20 @@ export const DEMO_REQUESTS = {
       attributes: [
         { key: "Revenue", value: "$2M", sort_order: 1 },
         { key: "Stage", value: "Series A", sort_order: 3 },
+        {
+          key: "Affinity",
+          data_type: "json",
+          source: "affinity",
+          sort_order: 4,
+          value: {
+            name: "Aurora Robotics",
+            url: "https://aurorarobotics.eu",
+            source: "Intro — María García (Acme Corp)",
+            funnel_stage: "Investment Committee",
+            ic_date: "2026-06-25",
+            owner: "deal-team",
+          },
+        },
       ],
     },
   },

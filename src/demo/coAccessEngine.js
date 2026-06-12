@@ -114,8 +114,15 @@ export function clusterBranches(state, threshold = 1.5, minBranchSize = 2) {
  * Greedy agglomerative merge: combine branches into trees.
  * Merges the two most-affiliated branches until count <= maxTrees.
  */
-export function mergeBranchesIntoTrees(branches, state, maxTrees = 12) {
-  if (branches.length <= maxTrees) {
+export function mergeBranchesIntoTrees(branches, state, maxTrees = 12, linkage = "sum", treeAffinity = Infinity) {
+  // With the default treeAffinity (Infinity) behavior is unchanged: merging
+  // only happens to get under maxTrees. A finite treeAffinity additionally
+  // merges any pair whose linkage weight reaches it, so related branches
+  // share a tree as soon as the affinity exists instead of reshuffling later.
+  if (branches.length <= maxTrees && !Number.isFinite(treeAffinity)) {
+    return branches.map((b) => [b]);
+  }
+  if (branches.length <= 1) {
     return branches.map((b) => [b]);
   }
 
@@ -139,7 +146,7 @@ export function mergeBranchesIntoTrees(branches, state, maxTrees = 12) {
   // Start: each branch is its own tree (array of branch indices)
   let treeBranches = branches.map((_, i) => [i]);
 
-  while (treeBranches.length > maxTrees) {
+  while (treeBranches.length > 1) {
     let bestPair = [-1, -1];
     let bestWeight = 0;
 
@@ -152,6 +159,10 @@ export function mergeBranchesIntoTrees(branches, state, maxTrees = 12) {
             w += branchWeights.get(bKey) || 0;
           }
         }
+        // Average linkage avoids one mega-tree absorbing everything
+        if (linkage === "avg" && w > 0) {
+          w /= treeBranches[i].length * treeBranches[j].length;
+        }
         if (w > bestWeight) {
           bestWeight = w;
           bestPair = [i, j];
@@ -160,6 +171,7 @@ export function mergeBranchesIntoTrees(branches, state, maxTrees = 12) {
     }
 
     if (bestWeight === 0) break;
+    if (treeBranches.length <= maxTrees && bestWeight < treeAffinity) break;
     treeBranches[bestPair[0]] = [
       ...treeBranches[bestPair[0]],
       ...treeBranches[bestPair[1]],
@@ -171,16 +183,79 @@ export function mergeBranchesIntoTrees(branches, state, maxTrees = 12) {
 }
 
 /**
- * Full clustering pipeline. Returns { branches, trees }.
+ * Secondary (multi-cluster) memberships: a pointer that already lives in a
+ * branch can ALSO belong to other branches it has strong accumulated
+ * co-access affinity with. Affinity = sum of pair weights from the pointer
+ * to the target branch's members. Pointers stay primary in exactly one
+ * branch (the union-find component); this adds overlay memberships.
+ *
+ * Returns [{ pointerId, branchIndex, weight }] sorted deterministically.
+ */
+export function computeSecondaryMemberships(
+  state,
+  branches,
+  secondaryThreshold = Infinity,
+  maxPerPointer = 2
+) {
+  if (!Number.isFinite(secondaryThreshold) || branches.length < 2) return [];
+
+  const primary = new Map(); // pointerId -> branchIndex
+  branches.forEach((ptrs, bi) => ptrs.forEach((p) => primary.set(p, bi)));
+
+  // Accumulate pointer → foreign-branch affinity
+  const affinity = new Map(); // "pid\0bi" -> weight
+  for (const [key, w] of state.weights) {
+    const [a, b] = key.split("\0");
+    const ba = primary.get(a);
+    const bb = primary.get(b);
+    if (ba === undefined || bb === undefined || ba === bb) continue;
+    const ka = `${a}\0${bb}`;
+    const kb = `${b}\0${ba}`;
+    affinity.set(ka, (affinity.get(ka) || 0) + w);
+    affinity.set(kb, (affinity.get(kb) || 0) + w);
+  }
+
+  // Group by pointer, keep the strongest few above threshold
+  const byPointer = new Map(); // pid -> [{ branchIndex, weight }]
+  for (const [key, w] of affinity) {
+    if (w < secondaryThreshold) continue;
+    const [pid, biStr] = key.split("\0");
+    const bi = Number(biStr);
+    if (!byPointer.has(pid)) byPointer.set(pid, []);
+    byPointer.get(pid).push({ branchIndex: bi, weight: w });
+  }
+
+  const result = [];
+  const pids = [...byPointer.keys()].sort();
+  for (const pid of pids) {
+    const list = byPointer
+      .get(pid)
+      .sort((x, y) => y.weight - x.weight || x.branchIndex - y.branchIndex)
+      .slice(0, maxPerPointer);
+    for (const m of list) {
+      result.push({ pointerId: pid, branchIndex: m.branchIndex, weight: m.weight });
+    }
+  }
+  return result;
+}
+
+/**
+ * Full clustering pipeline. Returns { branches, trees, secondary }.
  * trees is array of arrays of arrays: trees[treeIdx][branchIdx] = pointerIds[]
+ * secondary is [] unless options.secondaryThreshold is set (finite).
  */
 export function computeForest(state, options = {}) {
   const threshold = options.threshold ?? 1.5;
   const maxTrees = options.maxTrees ?? 12;
   const minBranchSize = options.minBranchSize ?? 2;
+  const linkage = options.linkage ?? "sum";
+  const treeAffinity = options.treeAffinity ?? Infinity;
+  const secondaryThreshold = options.secondaryThreshold ?? Infinity;
+  const maxSecondary = options.maxSecondary ?? 2;
 
   const branches = clusterBranches(state, threshold, minBranchSize);
-  const trees = mergeBranchesIntoTrees(branches, state, maxTrees);
+  const trees = mergeBranchesIntoTrees(branches, state, maxTrees, linkage, treeAffinity);
+  const secondary = computeSecondaryMemberships(state, branches, secondaryThreshold, maxSecondary);
 
-  return { branches, trees };
+  return { branches, trees, secondary };
 }

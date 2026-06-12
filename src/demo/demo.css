@@ -1,0 +1,247 @@
+/* Forest Creation demo HUD */
+
+/* Layout (100vw/100vh, relative) comes from .forest-root in App.css —
+   .demo-root must not redeclare sizing or it overrides it. */
+.demo-root {
+  font-family: Aptos, "Aptos Display", "Segoe UI", system-ui, sans-serif;
+}
+
+/* ── Phase title card ─────────────────────────────────────── */
+.demo-phase {
+  position: absolute;
+  top: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  pointer-events: none;
+  z-index: 60;
+  animation: demo-phase-in 0.8s ease both;
+}
+
+@keyframes demo-phase-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+.demo-phase-title {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: #111;
+}
+
+.demo-phase-sub {
+  margin-top: 3px;
+  font-size: 13px;
+  color: #777;
+  letter-spacing: 0.02em;
+}
+
+/* ── Stats panel + ticker ─────────────────────────────────── */
+.demo-panel {
+  position: absolute;
+  top: 22px;
+  right: 22px;
+  width: 240px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #e0e0e0;
+  padding: 14px 16px;
+  z-index: 60;
+}
+
+.demo-panel-header {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #999;
+  margin-bottom: 10px;
+}
+
+.demo-stats {
+  display: flex;
+  gap: 18px;
+}
+
+.demo-stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.demo-stat-num {
+  font-size: 24px;
+  font-weight: 650;
+  color: #111;
+  line-height: 1.1;
+}
+
+.demo-stat-dim {
+  font-size: 14px;
+  color: #aaa;
+  font-weight: 400;
+}
+
+.demo-stat-label {
+  font-size: 11px;
+  color: #888;
+  margin-top: 1px;
+}
+
+.demo-ticker {
+  margin-top: 12px;
+  border-top: 1px solid #eee;
+  padding-top: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.demo-ticker-row {
+  font-size: 12px;
+  color: #333;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.demo-ticker-tree { color: #0b5d1e; font-weight: 600; }
+.demo-ticker-branch { color: #1a1a1a; font-weight: 600; }
+.demo-ticker-grew { color: #666; }
+.demo-ticker-merge { color: #8a6d1a; }
+.demo-ticker-rename { color: #888; }
+.demo-ticker-link { color: #a87d10; font-weight: 600; }
+
+.demo-stat-gold { color: #a87d10; }
+
+/* ── Current query chip ───────────────────────────────────── */
+.demo-query {
+  position: absolute;
+  left: 22px;
+  bottom: 86px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 56%;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #e0e0e0;
+  padding: 8px 14px;
+  z-index: 60;
+  font-size: 13px;
+}
+
+.demo-query-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.demo-query-theme {
+  font-weight: 650;
+  color: #222;
+  white-space: nowrap;
+}
+
+.demo-query-text {
+  color: #777;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Playback bar ─────────────────────────────────────────── */
+.demo-bar {
+  position: absolute;
+  left: 22px;
+  right: 22px;
+  bottom: 22px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #e0e0e0;
+  padding: 10px 14px;
+  z-index: 70;
+}
+
+.demo-btn {
+  border: 1px solid #d5d5d5;
+  background: #fff;
+  color: #222;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 6px 11px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.demo-btn:hover { background: #f2f2f2; }
+
+.demo-btn-play {
+  font-size: 13px;
+  width: 42px;
+}
+
+.demo-btn-speed.active {
+  background: #111;
+  color: #fff;
+  border-color: #111;
+}
+
+.demo-speeds { display: flex; gap: 4px; }
+
+.demo-queries-count {
+  font-size: 13px;
+  font-weight: 650;
+  color: #111;
+  min-width: 86px;
+  text-align: right;
+}
+
+.demo-queries-count span {
+  font-weight: 400;
+  color: #999;
+  font-size: 11px;
+}
+
+/* Scrubber */
+.demo-scrub {
+  position: relative;
+  flex: 1;
+  height: 22px;
+}
+
+.demo-scrub-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 4px;
+  background: #ececec;
+  pointer-events: none;
+}
+
+.demo-scrub-fill {
+  height: 100%;
+  background: #111;
+}
+
+.demo-scrub-tick {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 10px;
+  background: #b9b9b9;
+}
+
+.demo-scrub-tick-tree { background: #0b5d1e; }
+
+.demo-scrub input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
