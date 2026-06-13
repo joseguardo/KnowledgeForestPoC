@@ -45,6 +45,15 @@ export default function useForestData() {
     fetchForest();
   }, [fetchForest]);
 
+  // Re-fetch whenever the signed-in identity changes: the forest is built from
+  // RLS-gated tables (get_tenant_forest is SECURITY INVOKER), so switching
+  // between Analyst and Partner reshapes the tree with no other change.
+  useEffect(() => {
+    if (!supabase) return;
+    const { data: sub } = supabase.auth.onAuthStateChange(() => fetchForest());
+    return () => sub.subscription.unsubscribe();
+  }, [fetchForest]);
+
   return {
     trees,
     branchIndex,

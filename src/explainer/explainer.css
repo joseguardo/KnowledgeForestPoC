@@ -1622,3 +1622,38 @@
   overflow-x: auto;
 }
 .xp-tech pre .c { color: #71717a; }
+
+/* ── Access control: same query, two clearances ───────────────────── */
+.xp-clr-examples {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px;
+}
+.xp-clr-examples .lab {
+  font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em;
+}
+.xp-clr-chip {
+  font: inherit; font-size: 11.5px; color: var(--ink-2);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 999px;
+  padding: 3px 11px; cursor: pointer; transition: border-color 0.15s, background 0.15s;
+}
+.xp-clr-chip:hover:not(:disabled) { border-color: #cfcfd4; background: var(--bg-soft); }
+.xp-clr-chip:disabled { opacity: 0.45; cursor: default; }
+
+.xp-clr-cols {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px; margin-top: 10px;
+}
+.xp-clr-col {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg-soft);
+  padding: 10px; min-width: 0;
+}
+.xp-clr-colhead {
+  display: flex; align-items: baseline; gap: 8px;
+  margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line-soft);
+}
+.xp-clr-colhead .who { font-weight: 700; font-size: 13px; color: var(--ink); }
+.xp-clr-colhead .sub { font-size: 11px; color: var(--ink-3); }
+.xp-clr-colhead.analyst .who { color: var(--blue); }
+.xp-clr-colhead.partner .who { color: var(--green); }
+.xp-clr-empty {
+  font-size: 12.5px; color: var(--ink-3); padding: 14px 6px; text-align: center; font-style: italic;
+}

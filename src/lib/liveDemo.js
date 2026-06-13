@@ -1,3 +1,4 @@
+import { createClient } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 
 /**
@@ -168,6 +169,57 @@ export async function runSearch({ type = "company", queryText = "", limit = 5 } 
   const { data, error } = await supabase.rpc("search_pointers", params);
   if (error) throw new Error(error.message);
   return { params, data };
+}
+
+/* ── Access control: the same search, two clearances ──────────────────
+   The exact same search_pointers request is run as two identities so the
+   explainer can show what Row-Level Security lets through. We use dedicated
+   non-persisting clients (not the page's shared session) so the two columns are
+   always a true Analyst-vs-Partner comparison, whatever the rest of the app is
+   signed in as. "Analyst" = anonymous (public class only); "Partner" = the
+   seeded demo account granted the confidential + restricted classes. */
+
+const PARTNER_DEMO = { email: "partner@kibo.demo", password: "kibo-partner" };
+let _anonClient = null;
+let _partnerClient = null;
+
+function makeClient(storageKey) {
+  const url = import.meta.env.VITE_SUPABASE_URL;
+  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error("Supabase client not configured (.env.local missing)");
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false, storageKey },
+  });
+}
+
+function anonClient() {
+  if (!_anonClient) _anonClient = makeClient("kf-demo-analyst");
+  return _anonClient;
+}
+
+async function partnerClient() {
+  if (_partnerClient) return _partnerClient;
+  const c = makeClient("kf-demo-partner");
+  const { error } = await c.auth.signInWithPassword(PARTNER_DEMO);
+  if (error) throw new Error("Demo Partner sign-in failed: " + error.message);
+  _partnerClient = c;
+  return c;
+}
+
+export async function runSearchClearances({ type = "any", queryText = "", limit = 8 } = {}) {
+  const params = {
+    p_types: type === "any" ? null : [type],
+    p_query_text: queryText.trim() ? queryText.trim() : null,
+    p_limit: limit,
+  };
+  const pc = await partnerClient();
+  const [analyst, partner] = await Promise.all([
+    anonClient().rpc("search_pointers", params),
+    pc.rpc("search_pointers", params),
+  ]);
+  if (analyst.error) throw new Error(analyst.error.message);
+  if (partner.error) throw new Error(partner.error.message);
+  return { params, analyst: analyst.data, partner: partner.data };
 }
 
 /* ── Cleanup ──────────────────────────────────────────────────────── */

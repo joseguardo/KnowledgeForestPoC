@@ -8,6 +8,7 @@ import {
   dupeLookalike,
   askKnowledge,
   runSearch,
+  runSearchClearances,
   resetDemo,
 } from "../lib/liveDemo";
 import "./explainer.css";
@@ -1909,6 +1910,184 @@ function TwoDoorsLive() {
   );
 }
 
+/* ── Access control: same query, two clearances ──────────────────── */
+
+const CLEARANCE_EXAMPLES = [
+  { label: "All founders", type: "person", text: "", hint: "Every person is confidential — the Analyst sees none of them." },
+  { label: "Factorial", type: "any", text: "Factorial", hint: "A deal-pipeline company — hidden from the Analyst entirely." },
+  { label: "OpenAI", type: "any", text: "OpenAI", hint: "A public company — but its revenue / funding attributes are confidential." },
+  { label: "Aurora (demo)", type: "any", text: "Aurora", hint: "Restricted — only top clearance sees it." },
+];
+
+function ClearanceResultList({ rows, lockedIds, lockedAttrsById }) {
+  if (!rows || rows.length === 0) {
+    return <div className="xp-clr-empty">Nothing visible at this clearance.</div>;
+  }
+  return (
+    <div className="xp-resultrows">
+      {rows.map((p, i) => {
+        const lockedRow = lockedIds?.has(p.id);
+        const lockedAttrs = lockedAttrsById?.get(p.id);
+        return (
+          <div
+            key={p.id}
+            className="xp-resultrow rich"
+            style={lockedRow ? { borderLeft: "3px solid #ef4444", paddingLeft: 8 } : undefined}
+          >
+            <div className="rowtop">
+              <span className="name"><span className="rankn">#{i + 1}</span> {p.label}</span>
+              {lockedRow && (
+                <span className="meta" style={{ color: "#ef4444", fontWeight: 600 }}>
+                  🔒 hidden from Analyst
+                </span>
+              )}
+            </div>
+            <div className="rowattrs">
+              <span className="typechip">{p.type}</span>
+              {(p.attributes || []).map((a) => {
+                const locked = lockedRow || lockedAttrs?.has(a.key);
+                return (
+                  <span
+                    key={a.key}
+                    className="attrchip"
+                    title={locked ? "Confidential attribute — invisible to the Analyst" : undefined}
+                    style={locked ? { background: "rgba(239,68,68,0.14)", color: "#fca5a5", borderColor: "rgba(239,68,68,0.4)" } : undefined}
+                  >
+                    {locked ? "🔒 " : ""}{a.key}: {typeof a.value === "string" ? a.value : JSON.stringify(a.value)}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ClearanceSearchLive() {
+  const [type, setType] = useState("person");
+  const [text, setText] = useState("");
+  const live = useLive(runSearchClearances);
+
+  const run = (t = type, q = text) => {
+    setType(t);
+    setText(q);
+    live.run({ type: t, queryText: q });
+  };
+
+  // Show a result immediately so the contrast is visible without a click.
+  useEffect(() => { live.run({ type: "person", queryText: "" }); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const analyst = live.result?.analyst;
+  const partner = live.result?.partner;
+
+  // Diff the two RLS-filtered responses to show *what* the gate removed:
+  // whole rows the Analyst can't see, and confidential attributes redacted
+  // from rows they can.
+  const analystIds = new Set((analyst?.results || []).map((r) => r.id));
+  const analystAttrKeysById = new Map(
+    (analyst?.results || []).map((r) => [r.id, new Set((r.attributes || []).map((a) => a.key))])
+  );
+  const lockedIds = new Set();
+  const lockedAttrsById = new Map();
+  (partner?.results || []).forEach((r) => {
+    if (!analystIds.has(r.id)) {
+      lockedIds.add(r.id);
+    } else {
+      const seen = analystAttrKeysById.get(r.id) || new Set();
+      const hidden = new Set((r.attributes || []).map((a) => a.key).filter((k) => !seen.has(k)));
+      if (hidden.size) lockedAttrsById.set(r.id, hidden);
+    }
+  });
+  const hiddenTotal = analyst && partner ? partner.total - analyst.total : null;
+
+  return (
+    <div className="xp-live" style={{ marginTop: 0 }}>
+      <div className="xp-live-head"><span className="xp-live-dot" /> Live — one query, run as two identities</div>
+
+      <div className="xp-form">
+        <label className="xp-formfield">
+          <span className="lab">What kind of thing</span>
+          <select value={type} onChange={(e) => run(e.target.value, text)}>
+            {SEARCH_TYPES.map((t) => (
+              <option key={t} value={t}>{t === "any" ? "any type" : t}</option>
+            ))}
+          </select>
+        </label>
+        <label className="xp-formfield grow">
+          <span className="lab">Words to match (optional)</span>
+          <input
+            type="text"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !live.loading && run()}
+            placeholder="e.g. Factorial, OpenAI, Aurora…"
+          />
+        </label>
+        <button className="xp-livebtn go" disabled={live.loading} onClick={() => run()}>
+          {live.loading && <span className="xp-spin" />}Run both
+        </button>
+      </div>
+
+      <div className="xp-clr-examples">
+        <span className="lab">Try:</span>
+        {CLEARANCE_EXAMPLES.map((ex) => (
+          <button key={ex.label} className="xp-clr-chip" disabled={live.loading} onClick={() => run(ex.type, ex.text)}>
+            {ex.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="xp-reqpreview">
+        <span className="lab">The identical request both identities send</span>
+        <pre style={{ marginTop: 6 }}>{`search_pointers(
+  p_types:      ${type === "any" ? "null  — every kind" : `["${type}"]`},
+  p_query_text: ${text.trim() ? `"${text.trim()}"` : "null  — no text filter"},
+  p_limit:      8
+)   // only the caller's identity (JWT) differs`}</pre>
+      </div>
+
+      {live.error && <LiveError error={live.error} />}
+
+      {!live.error && live.result && (
+        <>
+          {hiddenTotal != null && (
+            <div className="xp-chips" style={{ marginBottom: 4 }}>
+              <span className="xp-chip created">Analyst: {analyst.total} visible</span>
+              <span className="xp-chip merged">Partner: {partner.total} visible</span>
+              {hiddenTotal > 0
+                ? <span className="xp-chip pending">{hiddenTotal} record{hiddenTotal === 1 ? "" : "s"} hidden by RLS</span>
+                : <span style={{ fontSize: 12, color: "#9aa3b5" }}>no restricted matches for this query</span>}
+            </div>
+          )}
+          <div className="xp-clr-cols">
+            <div className="xp-clr-col">
+              <div className="xp-clr-colhead analyst">
+                <span className="who">Analyst</span>
+                <span className="sub">not signed in · public only</span>
+              </div>
+              <ClearanceResultList rows={analyst?.results} />
+            </div>
+            <div className="xp-clr-col">
+              <div className="xp-clr-colhead partner">
+                <span className="who">Partner</span>
+                <span className="sub">signed in · full clearance</span>
+              </div>
+              <ClearanceResultList rows={partner?.results} lockedIds={lockedIds} lockedAttrsById={lockedAttrsById} />
+            </div>
+          </div>
+          <p className="xp-livehint">
+            Same request, same database, same instant — the only difference is who is asking. The
+            rows and 🔒 attributes the Analyst is missing were filtered out <strong>inside Postgres
+            by Row-Level Security</strong>, never sent over the wire.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 /* ── Cost estimation ──────────────────────────────────────────────── */
 
 function CostSection() {
@@ -2379,6 +2558,25 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
 
       {/* RETRIEVAL DEEP-DIVE */}
       <RetrievalSection />
+
+      {/* ACCESS CONTROL */}
+      <section className="xp-section">
+        <Reveal>
+          <div className="xp-eyebrow accent-blue">Under the hood · Access control</div>
+          <h2 className="xp-h2">Who sees what — the same search, two clearances</h2>
+          <p className="xp-lead">
+            Every record carries an <strong>access class</strong> (public, confidential, restricted),
+            set when it was ingested. Retrieval doesn’t change — the same{" "}
+            <code>search_pointers</code> contract runs — but <strong>Row-Level Security filters the
+            results to the caller’s clearance inside the database</strong>. Restricted rows never
+            enter the ranking, the counts, or the response. Run the identical query as an
+            anonymous Analyst and as a signed-in Partner, and watch the gate work — it’s live.
+          </p>
+        </Reveal>
+        <Reveal delay={90}>
+          <ClearanceSearchLive />
+        </Reveal>
+      </section>
 
       {/* COSTS */}
       <CostSection />

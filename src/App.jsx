@@ -3,6 +3,7 @@ import useForestScene from "./hooks/useForestScene";
 import useForestData from "./hooks/useForestData";
 import usePointerMutation from "./hooks/usePointerMutation";
 import useQueryPathLogger from "./hooks/useQueryPathLogger";
+import useAuth from "./hooks/useAuth";
 
 const DemoApp = lazy(() => import("./demo/DemoApp"));
 const ExplainerPage = lazy(() => import("./explainer/ExplainerPage"));
@@ -18,6 +19,7 @@ import SearchPanel from "./components/SearchPanel";
 import StructureEvolutionAlert from "./components/StructureEvolutionAlert";
 import StatsPanel from "./components/StatsPanel";
 import ChatPanel from "./components/ChatPanel";
+import ClearanceBar from "./components/ClearanceBar";
 import "./App.css";
 
 const toolbarBtnStyle = {
@@ -70,6 +72,7 @@ function MainApp({ onDemo, onStory }) {
   } = usePointerMutation();
 
   const { logPointerAccess } = useQueryPathLogger();
+  const { identity, loading: authLoading, signInAsPartner, signOutToAnalyst } = useAuth();
 
   const [showInsert, setShowInsert] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
@@ -125,6 +128,13 @@ function MainApp({ onDemo, onStory }) {
 
       {!focusedTree && (
         <>
+          <ClearanceBar
+            identity={identity}
+            loading={authLoading}
+            onSignInPartner={signInAsPartner}
+            onSignOutAnalyst={signOutToAnalyst}
+          />
+
           <Legend
             autoRotate={autoRotate}
             onToggleAutoRotate={() => setAutoRotate((v) => !v)}
