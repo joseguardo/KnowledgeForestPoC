@@ -12,7 +12,21 @@ interface InsertPointerRequest {
   canonical_key?: string;
   metadata?: Record<string, unknown>;
   occurred_at?: string;
-  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string }[];
+  // Access class (security level) the ingesting process assigns to this record.
+  // Defaults to "public". A per-attribute `access_class` overrides it for that row.
+  access_class?: string;
+  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string }[];
+}
+
+const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
+
+// Resolve access-class keys -> ids once per request, so attribute/chunk/edge
+// rows can be stamped. (The pointer itself is stamped inside the RPC.)
+async function classResolver(supabase: ReturnType<typeof createClient>) {
+  const { data } = await supabase.from("access_classes").select("id,key");
+  const idByKey: Record<string, string> = {};
+  (data || []).forEach((c: { id: string; key: string }) => { idByKey[c.key] = c.id; });
+  return (key?: string) => idByKey[key || "public"] || PUBLIC_CLASS_ID;
 }
 
 async function getEmbedding(text: string): Promise<number[] | null> {
@@ -70,7 +84,10 @@ Deno.serve(async (req: Request) => {
       : body.label;
     const embedding = await getEmbedding(embeddingText);
 
-    // Call the dedup-aware insert RPC
+    const resolveClass = await classResolver(supabase);
+    const pointerClass = body.access_class || "public";
+
+    // Call the dedup-aware insert RPC (it stamps the pointer's access class)
     const { data: result, error: rpcError } = await supabase.rpc(
       "insert_pointer_with_dedup",
       {
@@ -79,6 +96,7 @@ Deno.serve(async (req: Request) => {
         p_canonical_key: body.canonical_key || null,
         p_metadata: body.metadata || {},
         p_embedding: embedding ? JSON.stringify(embedding) : null,
+        p_access_class: pointerClass,
       }
     );
 
@@ -100,6 +118,8 @@ Deno.serve(async (req: Request) => {
         data_type: attr.data_type || "string",
         sort_order: attr.sort_order ?? i,
         source: attr.source || "api",
+        // Per-attribute class override, else the pointer's class.
+        access_class_id: resolveClass(attr.access_class || pointerClass),
         updated_at: new Date().toISOString(),
       }));
 

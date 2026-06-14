@@ -14,12 +14,24 @@ interface BatchItem {
   canonical_key?: string;
   metadata?: Record<string, unknown>;
   occurred_at?: string;
-  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string }[];
+  access_class?: string;
+  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string }[];
 }
 
 interface BatchRequest {
   items: BatchItem[];
   source?: string;
+  // Default access class for every item that doesn't set its own.
+  access_class?: string;
+}
+
+const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
+
+async function classResolver(supabase: ReturnType<typeof createClient>) {
+  const { data } = await supabase.from("access_classes").select("id,key");
+  const idByKey: Record<string, string> = {};
+  (data || []).forEach((c: { id: string; key: string }) => { idByKey[c.key] = c.id; });
+  return (key?: string) => idByKey[key || "public"] || PUBLIC_CLASS_ID;
 }
 
 // One embedding API call for the whole batch instead of one per item.
@@ -85,6 +97,7 @@ Deno.serve(async (req: Request) => {
       item.metadata ? `${item.label} ${JSON.stringify(item.metadata)}` : item.label ?? ""
     );
     const embeddings = await getEmbeddings(embeddingTexts);
+    const resolveClass = await classResolver(supabase);
 
     const results: Record<string, unknown>[] = [];
 
@@ -97,6 +110,8 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
+      const itemClass = item.access_class || body.access_class || "public";
+
       const { data: result, error: rpcError } = await supabase.rpc(
         "insert_pointer_with_dedup",
         {
@@ -105,6 +120,7 @@ Deno.serve(async (req: Request) => {
           p_canonical_key: item.canonical_key || null,
           p_metadata: item.metadata || {},
           p_embedding: embeddings[i] ? JSON.stringify(embeddings[i]) : null,
+          p_access_class: itemClass,
         }
       );
 
@@ -128,6 +144,7 @@ Deno.serve(async (req: Request) => {
           data_type: attr.data_type || "string",
           sort_order: attr.sort_order ?? j,
           source: attr.source || body.source || "batch",
+          access_class_id: resolveClass(attr.access_class || itemClass),
           updated_at: new Date().toISOString(),
         }));
 

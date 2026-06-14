@@ -15,6 +15,8 @@ interface IngestDocumentRequest {
   occurred_at?: string;
   metadata?: Record<string, unknown>;
   chunk_size?: number;
+  // Access class (security level) for the document, its chunks and the link edge.
+  access_class?: string;
   link?: {
     target_id?: string;
     target_canonical_key?: string;
@@ -22,6 +24,13 @@ interface IngestDocumentRequest {
     relationship_type?: string;
     why?: string;
   };
+}
+
+const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
+
+async function resolveClassId(supabase: ReturnType<typeof createClient>, key?: string): Promise<string> {
+  const { data } = await supabase.from("access_classes").select("id").eq("key", key || "public").maybeSingle();
+  return data?.id || PUBLIC_CLASS_ID;
 }
 
 async function sha256(text: string): Promise<string> {
@@ -133,6 +142,9 @@ Deno.serve(async (req: Request) => {
     const docEmbedding = embeddings[0];
     const chunkEmbeddings = embeddings.slice(1);
 
+    const docClass = body.access_class || "public";
+    const docClassId = await resolveClassId(supabase, docClass);
+
     const { data: result, error: rpcError } = await supabase.rpc(
       "insert_pointer_with_dedup",
       {
@@ -141,6 +153,7 @@ Deno.serve(async (req: Request) => {
         p_canonical_key: canonicalKey,
         p_metadata: { ...(body.metadata || {}), char_count: body.content.length, chunk_count: chunks.length },
         p_embedding: docEmbedding ? JSON.stringify(docEmbedding) : null,
+        p_access_class: docClass,
       }
     );
 
@@ -167,6 +180,7 @@ Deno.serve(async (req: Request) => {
         content: c.content,
         heading: c.heading,
         embedding: chunkEmbeddings[i] ? JSON.stringify(chunkEmbeddings[i]) : null,
+        access_class_id: docClassId,
         metadata: {},
       }));
 
@@ -213,6 +227,7 @@ Deno.serve(async (req: Request) => {
             why: body.link.why || `Document "${body.title}" describes this entity`,
             payload: {},
             weight: 1.0,
+            access_class_id: docClassId,
           })
           .select("id, relationship_type, target_id")
           .single();

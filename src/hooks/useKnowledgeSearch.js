@@ -85,11 +85,19 @@ export default function useKnowledgeSearch() {
     setError(null);
 
     try {
+      // Send the signed-in user's JWT (falling back to anon) so query-knowledge
+      // runs its retrieval under the caller's clearance — RLS keeps restricted
+      // content out of both the results and the composed answer.
+      const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      const { data: { session } } = supabase ? await supabase.auth.getSession() : { data: { session: null } };
+      const token = session?.access_token || anonKey;
+
       const res = await fetch(`${SUPABASE_URL}/functions/v1/query-knowledge`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          apikey: anonKey,
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           query: query.trim(),
