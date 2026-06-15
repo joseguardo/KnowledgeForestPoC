@@ -2225,7 +2225,7 @@ function CleanupPill({ visible, onCleaned }) {
 }
 
 /* ── Page ─────────────────────────────────────────────────────────── */
-export default function ExplainerPage({ onEnterForest, onRunDemo }) {
+export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch }) {
   const [dirty, setDirty] = useState(false);
   const markDirty = () => setDirty(true);
 
@@ -2237,6 +2237,11 @@ export default function ExplainerPage({ onEnterForest, onRunDemo }) {
           Memory Layer
         </div>
         <nav>
+          {onResearch && (
+            <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onResearch}>
+              Industry research
+            </button>
+          )}
           <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onRunDemo}>
             Watch it grow
           </button>

@@ -7,6 +7,7 @@ import useAuth from "./hooks/useAuth";
 
 const DemoApp = lazy(() => import("./demo/DemoApp"));
 const ExplainerPage = lazy(() => import("./explainer/ExplainerPage"));
+const ResearchPage = lazy(() => import("./explainer/ResearchPage"));
 import Legend from "./components/Legend";
 import InstanceBrowser from "./components/InstanceBrowser";
 import InfoPanel from "./components/InfoPanel";
@@ -39,7 +40,7 @@ const viewFallback = (
 );
 
 export default function App() {
-  const [view, setView] = useState("story"); // "story" | "forest" | "demo"
+  const [view, setView] = useState("story"); // "story" | "forest" | "demo" | "research"
 
   if (view === "story") {
     return (
@@ -47,6 +48,18 @@ export default function App() {
         <ExplainerPage
           onEnterForest={() => setView("forest")}
           onRunDemo={() => setView("demo")}
+          onResearch={() => setView("research")}
+        />
+      </Suspense>
+    );
+  }
+
+  if (view === "research") {
+    return (
+      <Suspense fallback={viewFallback}>
+        <ResearchPage
+          onBack={() => setView("story")}
+          onEnterForest={() => setView("forest")}
         />
       </Suspense>
     );
