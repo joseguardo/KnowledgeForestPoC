@@ -60,22 +60,28 @@ export default function CalendarTimeline({ events, loading, emptyHint }) {
           </div>
           {g.items.map((ev) => {
             const m = ev.metadata || {};
+            const isEmail = m.event_type === "email";
             return (
               <div
                 key={ev.id}
                 style={{
                   marginBottom: 10,
                   paddingLeft: 10,
-                  borderLeft: "2px solid #cdd6e0",
+                  borderLeft: `2px solid ${isEmail ? "#d6cde0" : "#cdd6e0"}`,
                 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                  <span style={{ color: "#111", fontWeight: 600, fontSize: 13 }}>{ev.label}</span>
+                  <span style={{ color: "#111", fontWeight: 600, fontSize: 13 }}>
+                    {isEmail ? "✉️ " : "📅 "}{ev.label}
+                  </span>
                   <span style={{ color: "#999", fontSize: 11, whiteSpace: "nowrap" }}>
                     {ev.occurred_at ? timeFmt.format(new Date(ev.occurred_at)) : ""}
                   </span>
                 </div>
-                {m.location && (
+                {isEmail && m.from && (
+                  <div style={{ color: "#777", fontSize: 11, marginTop: 2 }}>from {m.from}</div>
+                )}
+                {!isEmail && m.location && (
                   <div style={{ color: "#777", fontSize: 11, marginTop: 2 }}>📍 {m.location}</div>
                 )}
                 {m.notes && (

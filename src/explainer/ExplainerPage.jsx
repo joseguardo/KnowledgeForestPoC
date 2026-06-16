@@ -10,6 +10,8 @@ import {
   runSearch,
   runSearchClearances,
   resetDemo,
+  companySyncInbox,
+  companyConnectCalendar,
 } from "../lib/liveDemo";
 import "./explainer.css";
 
@@ -475,6 +477,127 @@ function CrmDemo({ onWrite }) {
                 </>
               )}
             </ul>
+            <RawJson data={lastResult} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Company Management: a contact's inbox + calendar as one timeline ── */
+function CompanyMgmtDemo({ onWrite, onOpenCalendar }) {
+  const inbox = useLive(companySyncInbox, onWrite);
+  const calendar = useLive(companyConnectCalendar, onWrite);
+  const [step, setStep] = useState(0); // 0 = idle, 1 = inbox synced, 2 = calendar connected
+
+  // Single source of truth: the timeline renders the exact events the buttons send.
+  const emails = DEMO_REQUESTS.companyInbox.body.events.map((e) => ({ ...e, kind: "email" }));
+  const meetings = DEMO_REQUESTS.companyCalendar.body.events.map((e) => ({ ...e, kind: "meeting" }));
+  const items = [...(step >= 1 ? emails : []), ...(step >= 2 ? meetings : [])].sort(
+    (a, b) => new Date(a.start) - new Date(b.start)
+  );
+
+  const loading = inbox.loading || calendar.loading;
+  const lastResult = calendar.result || inbox.result;
+  const lastError = calendar.error || inbox.error;
+
+  const fmtDay = (iso) =>
+    new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+  return (
+    <div className="xp-stage">
+      <div className="xp-crm-card" style={{ opacity: step === 0 ? 0.45 : 1, transition: "opacity 0.4s ease" }}>
+        <div className="xp-crm-head">
+          <div className="xp-crm-logo">R</div>
+          <div>
+            <div className="xp-crm-name">Robin Calloway</div>
+            <div className="xp-crm-sub">contact · Helios Dynamics</div>
+          </div>
+        </div>
+        <div className="xp-crm-rows">
+          {step === 0 ? (
+            <div className="xp-crm-row"><span className="k" style={{ color: "#b3b8c2" }}>no interactions yet</span></div>
+          ) : (
+            items.map((it) => (
+              <div
+                key={it.canonical_key}
+                className={`xp-crm-row ${step === 2 && it.kind === "meeting" ? "added" : ""}`}
+              >
+                <span className="k">
+                  {it.kind === "email" ? "✉️ " : "📅 "}{it.title}
+                  <span style={{ display: "block", color: "#9aa3b5", fontSize: 11, fontWeight: 400, marginTop: 2 }}>
+                    {it.kind === "email" ? `from ${it.from}` : it.location}
+                  </span>
+                </span>
+                <span className="v">{fmtDay(it.start)}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="xp-live">
+        <div className="xp-live-head"><span className="xp-live-dot" /> Live — these buttons write to the real system</div>
+        <div className="xp-live-actions">
+          <button
+            className="xp-livebtn go"
+            disabled={loading}
+            onClick={async () => {
+              const r = await inbox.run();
+              if (r) setStep((s) => Math.max(s, 1));
+            }}
+          >
+            {inbox.loading && <span className="xp-spin" />}1 · Sync inbox
+          </button>
+          <button
+            className="xp-livebtn"
+            disabled={loading || step === 0}
+            onClick={async () => {
+              const r = await calendar.run();
+              if (r) setStep(2);
+            }}
+          >
+            {calendar.loading && <span className="xp-spin" />}2 · Connect calendar
+          </button>
+        </div>
+
+        <RequestPreview
+          req={step >= 1 ? DEMO_REQUESTS.companyCalendar : DEMO_REQUESTS.companyInbox}
+          label={step >= 1 ? "What button 2 actually sends" : "What button 1 actually sends"}
+          note={
+            step >= 1
+              ? "The same owner — so meetings land on the same Robin Calloway as the emails — and each event carries occurred_at. Calendar entries and emails become one ordered timeline."
+              : "Every email becomes an event with event_type 'email', occurred_at, and a link to Helios Dynamics. Re-running merges by canonical_key, so nothing is duplicated."
+          }
+        />
+
+        {lastError && <LiveError error={lastError} />}
+        {!lastError && lastResult && (
+          <div className="xp-live-result">
+            <div className="xp-chips">
+              <span style={{ fontSize: 12, color: "#9aa3b5" }}>
+                contact id {shortId(lastResult.owner?.pointer_id)}
+              </span>
+            </div>
+            <ul className="xp-facts">
+              <li>
+                <strong>{lastResult.items_produced} interaction{lastResult.items_produced === 1 ? "" : "s"}</strong>{" "}
+                written to memory as events on Robin's timeline — every one linked to{" "}
+                <strong>Helios Dynamics</strong> and tagged with where it came from.
+              </li>
+              {step >= 2 && (
+                <li>
+                  Emails and meetings now sit in <strong>one chronological stream</strong> — the whole
+                  relationship at a glance, fed automatically as new mail and invites arrive.
+                </li>
+              )}
+            </ul>
+            {onOpenCalendar && (
+              <button className="xp-livebtn" style={{ marginTop: 10 }} onClick={onOpenCalendar}>
+                Open Robin in the Calendar →
+              </button>
+            )}
             <RawJson data={lastResult} />
           </div>
         )}
@@ -2225,7 +2348,7 @@ function CleanupPill({ visible, onCleaned }) {
 }
 
 /* ── Page ─────────────────────────────────────────────────────────── */
-export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch, onIngest }) {
+export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch, onIngest, onCalendar }) {
   const [dirty, setDirty] = useState(false);
   const markDirty = () => setDirty(true);
 
@@ -2367,6 +2490,56 @@ export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch, on
           </Reveal>
           <Reveal delay={120}>
             <CrmDemo onWrite={markDirty} />
+          </Reveal>
+        </div>
+      </section>
+
+      {/* USE CASE: COMPANY MANAGEMENT */}
+      <section className="xp-section">
+        <div className="xp-usecase">
+          <Reveal>
+            <div className="xp-eyebrow accent-cyan">Use case · Company Management</div>
+            <h2 className="xp-h2">One person, every interaction</h2>
+            <p className="xp-lead">
+              Connect a contact's inbox and calendar and every email and meeting lands on the{" "}
+              <strong>same person</strong> — one timeline of the whole relationship, the way
+              Affinity tracks a deal. Press the two buttons in order and watch the interactions
+              stream in.
+            </p>
+            <ul className="xp-points">
+              <li>
+                <span className="tick">✓</span>
+                <span>
+                  <strong>Emails and meetings, one stream.</strong> Both become time-stamped events
+                  on the person's card — ordered by when they happened, not by which tool they came from.
+                </span>
+              </li>
+              <li>
+                <span className="tick">✓</span>
+                <span>
+                  <strong>Always tied to the company.</strong> Each interaction links to{" "}
+                  <em>Helios Dynamics</em>, so the relationship rolls up to the account automatically.
+                </span>
+              </li>
+              <li>
+                <span className="tick">✓</span>
+                <span>
+                  <strong>Provenance kept.</strong> Every event remembers its source —{" "}
+                  <code className="xp-inlinecode">gmail</code> or{" "}
+                  <code className="xp-inlinecode">google-calendar</code> — and when it occurred.
+                </span>
+              </li>
+              <li>
+                <span className="tick">✓</span>
+                <span>
+                  <strong>Fed automatically, never duplicated.</strong> Re-syncing merges by
+                  canonical key — the same meeting is recognized, not re-created.
+                </span>
+              </li>
+            </ul>
+          </Reveal>
+          <Reveal delay={120}>
+            <CompanyMgmtDemo onWrite={markDirty} onOpenCalendar={onCalendar} />
           </Reveal>
         </div>
       </section>

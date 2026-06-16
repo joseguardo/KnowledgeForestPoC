@@ -53,6 +53,7 @@ export default function App() {
           onRunDemo={() => setView("demo")}
           onResearch={() => setView("research")}
           onIngest={() => setView("ingest")}
+          onCalendar={() => setView("calendar")}
         />
       </Suspense>
     );

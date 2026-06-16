@@ -29,6 +29,9 @@ interface CalEvent {
   end?: string;
   location?: string;
   notes?: string;
+  event_type?: string;    // 'meeting' (default) | 'email' | …
+  from?: string;          // sender, for emails
+  canonical_key?: string; // override (else event:<owner>:<start>)
   attendees?: Entity[];   // people in the meeting
   company?: string;       // company the meeting is about (by label)
 }
@@ -151,16 +154,17 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
-      const canonicalKey = `event:${body.owner.label}:${ev.start}`;
+      const canonicalKey = ev.canonical_key || `event:${body.owner.label}:${ev.start}`;
       const { data: r, error } = await supabase.rpc("insert_pointer_with_dedup", {
         p_label: ev.title,
         p_type: "event",
         p_canonical_key: canonicalKey,
         p_metadata: {
-          event_type: "meeting",
+          event_type: ev.event_type || "meeting",
           location: ev.location || null,
           notes: ev.notes || null,
           end: ev.end || null,
+          from: ev.from || null,
         },
         p_embedding: eventEmb[i] ? JSON.stringify(eventEmb[i]) : null,
         p_access_class: defaultClass,

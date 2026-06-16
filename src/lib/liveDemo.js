@@ -118,6 +118,68 @@ export const DEMO_REQUESTS = {
     fn: "query-knowledge",
     body: { query, mode: "answer" },
   }),
+
+  // Company Management: one contact's inbox + calendar as a single interaction
+  // stream. Demo-namespaced (canonical_key "demo:*", label "(demo)") and public
+  // so the explainer reads them back and demo-reset wipes them.
+  companyInbox: {
+    fn: "ingest-calendar",
+    body: {
+      owner: { label: "Robin Calloway (demo)", canonical_key: "demo:person-robin" },
+      access_class: "public",
+      source: "gmail",
+      events: [
+        {
+          title: "Intro — warehouse automation pilot",
+          start: "2026-05-09T08:12:00Z",
+          event_type: "email",
+          from: "robin@heliosdyn.example",
+          notes: "Robin asks for a scoped pilot across two Helios distribution centres.",
+          canonical_key: "demo:evt-email-1",
+          company: "Helios Dynamics (demo)",
+        },
+        {
+          title: "Re: Pilot rollout timeline",
+          start: "2026-05-12T14:48:00Z",
+          event_type: "email",
+          from: "robin@heliosdyn.example",
+          notes: "Wants to confirm dates before the budget review.",
+          canonical_key: "demo:evt-email-2",
+          company: "Helios Dynamics (demo)",
+        },
+      ],
+    },
+  },
+  companyCalendar: {
+    fn: "ingest-calendar",
+    body: {
+      owner: { label: "Robin Calloway (demo)", canonical_key: "demo:person-robin" },
+      access_class: "public",
+      source: "google-calendar",
+      events: [
+        {
+          title: "Discovery call — Helios Dynamics",
+          start: "2026-05-14T15:00:00Z",
+          end: "2026-05-14T15:45:00Z",
+          event_type: "meeting",
+          location: "Zoom",
+          notes: "Walked through the pilot scope and success metrics.",
+          canonical_key: "demo:evt-mtg-1",
+          company: "Helios Dynamics (demo)",
+        },
+        {
+          title: "Technical deep-dive",
+          start: "2026-05-18T10:30:00Z",
+          end: "2026-05-18T11:30:00Z",
+          event_type: "meeting",
+          location: "Helios HQ",
+          notes: "Integration with their WMS; security review owners assigned.",
+          canonical_key: "demo:evt-mtg-2",
+          company: "Helios Dynamics (demo)",
+        },
+      ],
+    },
+  },
 };
 
 /* ── CRM: create, then re-ingest to watch merge + enrichment ─────── */
@@ -128,6 +190,18 @@ export function crmCreate() {
 
 export function crmEnrich() {
   return invoke(DEMO_REQUESTS.crmEnrich.fn, DEMO_REQUESTS.crmEnrich.body);
+}
+
+/* ── Company Management: a contact's inbox + calendar as one timeline ── */
+
+export function companySyncInbox() {
+  return invoke(DEMO_REQUESTS.companyInbox.fn, DEMO_REQUESTS.companyInbox.body);
+}
+
+export async function companyConnectCalendar() {
+  // Ensure the contact card exists first (idempotent), then add the meetings.
+  await companySyncInbox();
+  return invoke(DEMO_REQUESTS.companyCalendar.fn, DEMO_REQUESTS.companyCalendar.body);
 }
 
 /* ── Documents: real ingestion with fingerprint, chunks, link ────── */
