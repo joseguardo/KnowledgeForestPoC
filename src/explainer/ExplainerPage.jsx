@@ -2225,7 +2225,7 @@ function CleanupPill({ visible, onCleaned }) {
 }
 
 /* ── Page ─────────────────────────────────────────────────────────── */
-export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch }) {
+export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch, onIngest }) {
   const [dirty, setDirty] = useState(false);
   const markDirty = () => setDirty(true);
 
@@ -2240,6 +2240,11 @@ export default function ExplainerPage({ onEnterForest, onRunDemo, onResearch }) 
           {onResearch && (
             <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onResearch}>
               Industry research
+            </button>
+          )}
+          {onIngest && (
+            <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onIngest}>
+              Ingest
             </button>
           )}
           <button className="xp-btn ghost" style={{ padding: "9px 18px", fontSize: 13 }} onClick={onRunDemo}>

@@ -5,6 +5,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from pipeline.client import EdgeFunctionClient
@@ -27,6 +28,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="KnowledgeForest Ingestion Pipeline", version="0.1.0", lifespan=lifespan)
+
+# ── CORS ───────────────────────────────────────────────────────────
+# Allow the browser-based frontend (Vite dev server) to call the pipeline.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ── Exception handlers ─────────────────────────────────────────────

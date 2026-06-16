@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     max_retries: int = 3
     retry_backoff_base: float = 1.0
 
+    # Browser origins allowed to call the pipeline (CORS). Comma-separated in
+    # the env var; defaults to the Vite dev server. Use "*" to allow any.
+    cors_origins: str = "http://localhost:5173"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

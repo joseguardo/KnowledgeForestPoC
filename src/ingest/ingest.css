@@ -1,0 +1,163 @@
+/* ── Ingestion console — builds on explainer.css / research.css tokens ── */
+
+.ig-root {
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.ig-section {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 56px 32px 96px;
+}
+
+/* ── Health pill ───────────────────────────────────────────────────── */
+.ig-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 600;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.ig-pill .ig-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
+.ig-pill.ok { color: var(--green); border-color: var(--green-line); background: var(--green-bg); }
+.ig-pill.ok .ig-dot { background: var(--green); }
+.ig-pill.offline { color: var(--red); border-color: #fecaca; background: var(--red-bg); }
+.ig-pill.offline .ig-dot { background: var(--red); }
+.ig-pill.unknown { color: var(--ink-3); }
+
+/* ── Tabs ──────────────────────────────────────────────────────────── */
+.ig-tabs {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 28px 0 18px;
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 0;
+}
+.ig-tab {
+  appearance: none; background: transparent; cursor: pointer;
+  border: none; border-bottom: 2px solid transparent;
+  padding: 10px 14px; margin-bottom: -1px;
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--ink-3);
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.ig-tab:hover { color: var(--ink-2); }
+.ig-tab.active { color: var(--ink); border-bottom-color: var(--ink); }
+
+/* ── Form card ─────────────────────────────────────────────────────── */
+.ig-card {
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--rp-radius, 14px);
+  padding: 24px;
+  box-shadow: 0 1px 2px rgba(24, 24, 27, 0.04);
+  display: grid;
+  gap: 16px;
+}
+.ig-hint { margin: 0; font-size: 12.5px; color: var(--ink-3); }
+
+.ig-field { display: grid; gap: 6px; }
+.ig-field-label {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; font-weight: 600; color: var(--ink);
+}
+.ig-field-hint { font-size: 11px; font-weight: 400; color: var(--ink-3); }
+.ig-req { color: var(--red); }
+
+.ig-input {
+  width: 100%; box-sizing: border-box;
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 11px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.ig-input:focus {
+  outline: none; background: var(--bg);
+  border-color: var(--ink-3);
+  box-shadow: 0 0 0 3px rgba(24, 24, 27, 0.05);
+}
+.ig-textarea { resize: vertical; line-height: 1.5; }
+.ig-mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+.ig-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 620px) { .ig-row { grid-template-columns: 1fr; } }
+
+.ig-link-btn {
+  justify-self: start;
+  appearance: none; background: none; border: none; cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600; color: var(--blue);
+  padding: 0; margin-top: -6px;
+}
+.ig-link-btn:hover { text-decoration: underline; }
+
+/* ── Shared options block ──────────────────────────────────────────── */
+.ig-options {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 16px;
+  display: grid; gap: 14px;
+}
+.ig-options-lab {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.ig-actions { display: flex; gap: 10px; align-items: center; }
+.xp-btn.primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── Banners ───────────────────────────────────────────────────────── */
+.ig-banner {
+  font-size: 12.5px; line-height: 1.5;
+  padding: 11px 13px; border-radius: 9px;
+}
+.ig-banner.error {
+  color: var(--red); background: var(--red-bg); border: 1px solid #fecaca;
+}
+
+/* ── Results ───────────────────────────────────────────────────────── */
+.ig-results {
+  margin-top: 24px;
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--rp-radius, 14px);
+  padding: 20px 22px;
+  box-shadow: 0 1px 2px rgba(24, 24, 27, 0.04);
+}
+.ig-results-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 14px; color: var(--ink);
+  padding-bottom: 14px; border-bottom: 1px solid var(--line-soft);
+}
+.ig-results-head strong { font-size: 17px; }
+.ig-results-meta {
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--ink-3);
+}
+.ig-results-cta { margin-left: auto; }
+
+.ig-result-list { list-style: none; margin: 0; padding: 0; }
+.ig-result-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 0; border-bottom: 1px solid var(--line-soft);
+  font-size: 12.5px;
+}
+.ig-result-row:last-child { border-bottom: none; }
+.ig-result-id {
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--ink-2);
+}
+.ig-result-idx { font-size: 11px; color: var(--ink-3); }
+.ig-result-err { color: var(--red); font-size: 11.5px; }
+
+.ig-badge {
+  display: inline-block; flex: none;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 6px;
+  border: 1px solid var(--line);
+  color: var(--ink-2); background: var(--bg-soft);
+}
+.ig-badge.created { color: var(--green); background: var(--green-bg); border-color: var(--green-line); }
+.ig-badge.merged { color: var(--blue); background: var(--blue-bg); border-color: var(--blue-line); }
+.ig-badge.pending_review { color: var(--amber); background: var(--amber-bg); border-color: var(--amber-line); }
+.ig-badge.error { color: var(--red); background: var(--red-bg); border-color: #fecaca; }
+
+.ig-errors { margin-top: 14px; display: grid; gap: 8px; }

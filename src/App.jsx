@@ -8,6 +8,7 @@ import useAuth from "./hooks/useAuth";
 const DemoApp = lazy(() => import("./demo/DemoApp"));
 const ExplainerPage = lazy(() => import("./explainer/ExplainerPage"));
 const ResearchPage = lazy(() => import("./explainer/ResearchPage"));
+const IngestPage = lazy(() => import("./ingest/IngestPage"));
 import Legend from "./components/Legend";
 import InstanceBrowser from "./components/InstanceBrowser";
 import InfoPanel from "./components/InfoPanel";
@@ -40,7 +41,7 @@ const viewFallback = (
 );
 
 export default function App() {
-  const [view, setView] = useState("story"); // "story" | "forest" | "demo" | "research"
+  const [view, setView] = useState("story"); // "story" | "forest" | "demo" | "research" | "ingest"
 
   if (view === "story") {
     return (
@@ -49,6 +50,7 @@ export default function App() {
           onEnterForest={() => setView("forest")}
           onRunDemo={() => setView("demo")}
           onResearch={() => setView("research")}
+          onIngest={() => setView("ingest")}
         />
       </Suspense>
     );
@@ -73,10 +75,24 @@ export default function App() {
     );
   }
 
-  return <MainApp onDemo={() => setView("demo")} onStory={() => setView("story")} />;
+  if (view === "ingest") {
+    return (
+      <Suspense fallback={viewFallback}>
+        <IngestPage onBack={() => setView("story")} onEnterForest={() => setView("forest")} />
+      </Suspense>
+    );
+  }
+
+  return (
+    <MainApp
+      onDemo={() => setView("demo")}
+      onStory={() => setView("story")}
+      onIngest={() => setView("ingest")}
+    />
+  );
 }
 
-function MainApp({ onDemo, onStory }) {
+function MainApp({ onDemo, onStory, onIngest }) {
   const { trees, branchIndex, houses, refetch } = useForestData();
   const {
     insertPointer, resolveDuplicate,
@@ -260,6 +276,17 @@ function MainApp({ onDemo, onStory }) {
             }}
           >
             Chat
+          </button>
+          <button
+            onClick={onIngest}
+            style={{
+              ...toolbarBtnStyle,
+              background: "#0f3d2e",
+              color: "#fff",
+              border: "1px solid #1f5a44",
+            }}
+          >
+            Ingest
           </button>
           <button
             onClick={onDemo}
