@@ -1,6 +1,28 @@
 /* ── Research page — builds on explainer.css tokens ────────────────── */
 
-.rp-root { /* inherits all --vars from .xp-root */ }
+.rp-root {
+  /* inherits all colour --vars from .xp-root; adds a single spacing scale
+     so every component on this page draws padding / gaps / radii / widths
+     from the same source instead of ad-hoc per-rule values. */
+  --rp-maxw: 1100px;        /* content column width */
+  --rp-pad-x: 32px;         /* horizontal page gutter */
+  --rp-section-y: 84px;     /* uniform vertical rhythm between sections */
+  --rp-stack: 28px;         /* gap between an intro block and the grid below it */
+
+  --rp-gap: 16px;           /* grids of full cards (legend, use-case panels) */
+  --rp-gap-sm: 10px;        /* dense grids & lists (index, examples) */
+
+  --rp-card-pad: 22px 24px; /* every full card: legend card, panel */
+  --rp-card-pad-sm: 13px 15px; /* every inner card: tension, example, index item */
+
+  --rp-radius: 14px;        /* full cards */
+  --rp-radius-sm: 10px;     /* inner cards & pills */
+}
+
+/* ── Uniform page shell: one width, one vertical rhythm ────────────── */
+.rp-root .xp-section { max-width: var(--rp-maxw); padding: var(--rp-section-y) var(--rp-pad-x); }
+.rp-root .xp-hero    { padding: 112px var(--rp-pad-x) 64px; }
+.rp-root .xp-footer  { padding: 96px var(--rp-pad-x) 112px; }
 
 /* Accent resolver: a panel/card with accent-* exposes --ac / --ac-bg / --ac-line */
 .accent-green  { --ac: var(--green);  --ac-bg: var(--green-bg);  --ac-line: var(--green-line); }
@@ -9,7 +31,7 @@
 .accent-amber  { --ac: var(--amber);  --ac-bg: var(--amber-bg);  --ac-line: var(--amber-line); }
 
 /* ── Hero diagram ──────────────────────────────────────────────────── */
-.rp-diagram { width: 100%; height: auto; display: block; }
+.rp-diagram { width: 100%; max-width: 840px; height: auto; display: block; margin: 28px auto 0; }
 .rp-edge { stroke: #d4d4d8; stroke-width: 1.4; stroke-dasharray: 3 4; }
 .rp-hub-label { font-size: 14px; font-weight: 600; fill: #fff; letter-spacing: -0.01em;
   font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
@@ -23,15 +45,15 @@
 .rp-legend {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 14px;
-  margin-bottom: 26px;
+  gap: var(--rp-gap);
+  margin-bottom: var(--rp-stack);
 }
 @media (max-width: 760px) { .rp-legend { grid-template-columns: 1fr; } }
 .rp-legend-card {
   background: var(--bg);
   border: 1px solid var(--line-soft);
-  border-radius: 12px;
-  padding: 20px 22px;
+  border-radius: var(--rp-radius);
+  padding: var(--rp-card-pad);
   box-shadow: 0 1px 2px rgba(24, 24, 27, 0.04);
 }
 .rp-legend-card .num {
@@ -46,8 +68,8 @@
 /* ── Quick index ───────────────────────────────────────────────────── */
 .rp-index {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--rp-gap-sm);
 }
 .rp-index-item {
   display: flex; align-items: center; gap: 11px;
@@ -55,8 +77,8 @@
   background: var(--bg);
   border: 1px solid var(--line-soft);
   border-left: 3px solid var(--ac, var(--line));
-  border-radius: 10px;
-  padding: 12px 14px;
+  border-radius: var(--rp-radius-sm);
+  padding: var(--rp-card-pad-sm);
   transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
 }
 .rp-index-item:hover { box-shadow: 0 4px 16px rgba(24,24,27,0.06); transform: translateY(-1px); border-color: var(--ac-line, #d4d4d8); border-left-color: var(--ac); }
@@ -85,9 +107,9 @@
 /* ── Three uniform panels ──────────────────────────────────────────── */
 .rp-uc-grid {
   display: grid;
-  grid-template-columns: 1.25fr 1fr 1fr;
-  gap: 14px;
-  margin-top: 26px;
+  grid-template-columns: 1.2fr 1fr 1fr;
+  gap: var(--rp-gap);
+  margin-top: var(--rp-stack);
   align-items: start;
 }
 @media (max-width: 980px) { .rp-uc-grid { grid-template-columns: 1fr; } }
@@ -96,8 +118,8 @@
   background: var(--bg);
   border: 1px solid var(--line-soft);
   border-top: 3px solid var(--ac, var(--line));
-  border-radius: 12px;
-  padding: 20px 22px;
+  border-radius: var(--rp-radius);
+  padding: var(--rp-card-pad);
   box-shadow: 0 1px 2px rgba(24, 24, 27, 0.04);
   height: 100%;
 }
@@ -115,20 +137,33 @@
   border-radius: 5px; padding: 1px 5px; color: var(--ink-2);
 }
 
-/* theory points */
-.rp-points { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; }
+/* theory points — a labeled, indexed, divided field list */
+.rp-theory-lab {
+  display: block;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--ink-3); margin: 0 0 2px;
+}
+.rp-points {
+  list-style: none; margin: 0; padding: 0;
+  border-top: 1px solid var(--line-soft);
+}
 .rp-points li {
-  display: flex; gap: 9px; align-items: flex-start;
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 10px; align-items: baseline;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line-soft);
   font-size: 12.5px; line-height: 1.55; color: var(--ink-2);
 }
-.rp-tick {
-  flex: none; width: 6px; height: 6px; margin-top: 6px;
-  border-radius: 50%; background: var(--ac);
+.rp-n {
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px; font-weight: 700; color: var(--ac);
+  font-variant-numeric: tabular-nums;
 }
 
 .rp-tension {
-  margin-top: 16px; padding: 12px 14px;
-  background: var(--ac-bg); border: 1px dashed var(--ac-line); border-radius: 10px;
+  margin-top: var(--rp-gap); padding: var(--rp-card-pad-sm);
+  background: var(--ac-bg); border: 1px dashed var(--ac-line); border-radius: var(--rp-radius-sm);
 }
 .rp-tension .lab {
   display: block; font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
@@ -138,13 +173,13 @@
 .rp-tension strong { color: var(--ink); font-weight: 600; }
 
 /* practical examples */
-.rp-examples { display: grid; gap: 10px; }
+.rp-examples { display: grid; gap: var(--rp-gap-sm); }
 .rp-example {
   display: grid; gap: 3px;
-  padding: 11px 13px;
+  padding: var(--rp-card-pad-sm);
   background: var(--bg-soft);
   border: 1px solid var(--line-soft);
-  border-radius: 9px;
+  border-radius: var(--rp-radius-sm);
 }
 .rp-example .src {
   font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em;

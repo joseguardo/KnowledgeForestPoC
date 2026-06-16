@@ -487,9 +487,13 @@ function UseCase({ uc }) {
         <Reveal delay={0} className={`rp-panel theory accent-${uc.accent}`}>
           <span className="rp-panel-lab">1 · Theoretical approach</span>
           <p className="rp-panel-summary">{uc.theory.summary}</p>
+          <span className="rp-theory-lab">The breakdown</span>
           <ul className="rp-points">
             {uc.theory.points.map((p, i) => (
-              <li key={i}><span className="rp-tick" />{p}</li>
+              <li key={i}>
+                <span className="rp-n">{String(i + 1).padStart(2, "0")}</span>
+                <span className="rp-pt">{p}</span>
+              </li>
             ))}
           </ul>
           <div className="rp-tension">
