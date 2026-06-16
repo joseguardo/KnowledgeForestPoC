@@ -3,15 +3,18 @@ import "../explainer/explainer.css";
 import "../explainer/research.css";
 import "./ingest.css";
 import useIngestion from "../hooks/useIngestion";
+import { ingestCalendar } from "../lib/calendarApi";
 
-/* The five pipeline source types, in tab order. `source` is the value passed
-   to useIngestion().submit() and maps to a backend endpoint. */
+/* Source types, in tab order. Most route through useIngestion().submit() to a
+   backend endpoint; "calendar" calls the ingest-calendar Edge Function directly
+   (see handleSubmit) so it works without the FastAPI pipeline running. */
 const TABS = [
   { key: "document", label: "Document", hint: "Upload a PDF, email, markdown or text file." },
   { key: "text", label: "Text", hint: "Paste raw text to ingest as a document." },
   { key: "structured", label: "Entities", hint: "Bulk-insert structured entities as JSON." },
   { key: "web", label: "Web URL", hint: "Scrape and ingest a public web page." },
   { key: "conversation", label: "Conversation", hint: "Ingest a chat or meeting transcript." },
+  { key: "calendar", label: "Calendar", hint: "Upload a person's calendar — each meeting becomes a linked event in the memory layer." },
 ];
 
 const ACCESS_CLASSES = ["public", "internal", "confidential", "restricted"];
@@ -34,6 +37,56 @@ const ENTITIES_EXAMPLE = JSON.stringify(
       },
     ],
     source: "manual-entry",
+  },
+  null,
+  2
+);
+
+/* A realistic one-person calendar. Attendee/company labels match existing
+   forest entities (George Kurtz / CrowdStrike, Tim Cook / Apple, …) so the
+   meetings auto-link to people already in the graph. */
+const CALENDAR_EXAMPLE = JSON.stringify(
+  {
+    owner: { label: "Jordan Ellis (Partner)", type: "person" },
+    access_class: "confidential",
+    events: [
+      {
+        title: "Intro call — George Kurtz",
+        start: "2026-06-02T15:00:00Z",
+        end: "2026-06-02T15:30:00Z",
+        location: "Zoom",
+        notes: "Discussed CrowdStrike's platform roadmap and AI threat detection.",
+        attendees: [{ label: "George Kurtz", type: "person" }],
+        company: "CrowdStrike",
+      },
+      {
+        title: "Partnership sync — Tim Cook",
+        start: "2026-06-05T09:30:00Z",
+        end: "2026-06-05T10:15:00Z",
+        location: "Cupertino",
+        notes: "Services strategy and DMA gatekeeper obligations.",
+        attendees: [{ label: "Tim Cook", type: "person" }],
+        company: "Apple",
+      },
+      {
+        title: "AI infra deep-dive — Jensen Huang",
+        start: "2026-06-09T17:00:00Z",
+        end: "2026-06-09T18:00:00Z",
+        location: "Santa Clara",
+        notes: "GPU supply outlook for frontier training runs.",
+        attendees: [{ label: "Jensen Huang", type: "person" }],
+        company: "NVIDIA",
+      },
+      {
+        title: "Payments review — Patrick Collison",
+        start: "2026-06-12T13:00:00Z",
+        end: "2026-06-12T13:45:00Z",
+        location: "Phone",
+        notes: "PSD2 / SCA compliance and EU expansion.",
+        attendees: [{ label: "Patrick Collison", type: "person" }],
+        company: "Stripe",
+      },
+    ],
   },
   null,
   2
@@ -69,7 +122,26 @@ export default function IngestPage({ onBack, onEnterForest }) {
   const [itemsJson, setItemsJson] = useState("");
   const [jsonError, setJsonError] = useState(null);
 
+  // Calendar tab calls the Edge Function directly, so it tracks its own state.
+  const [calendarJson, setCalendarJson] = useState("");
+  const [calResponse, setCalResponse] = useState(null);
+  const [calError, setCalError] = useState(null);
+  const [calSubmitting, setCalSubmitting] = useState(false);
+
   const activeTab = TABS.find((t) => t.key === tab);
+
+  // Whichever path produced the latest result drives the shared Results/error UI.
+  const submitting = isSubmitting || calSubmitting;
+  const displayResponse = tab === "calendar" ? calResponse : lastResponse;
+  const displayError = tab === "calendar" ? calError : error;
+
+  const clearAll = () => {
+    clearResult();
+    clearError();
+    setJsonError(null);
+    setCalResponse(null);
+    setCalError(null);
+  };
 
   const link = useMemo(() => {
     if (!linkKey.trim()) return undefined;
@@ -80,21 +152,49 @@ export default function IngestPage({ onBack, onEnterForest }) {
   }, [linkKey, linkRel]);
 
   const canSubmit = useMemo(() => {
-    if (isSubmitting) return false;
+    if (submitting) return false;
     switch (tab) {
       case "document": return !!file;
       case "text": return content.trim().length > 0;
       case "structured": return itemsJson.trim().length > 0;
       case "web": return url.trim().length > 0;
       case "conversation": return content.trim().length > 0;
+      case "calendar": return calendarJson.trim().length > 0;
       default: return false;
     }
-  }, [tab, isSubmitting, file, content, itemsJson, url]);
+  }, [tab, submitting, file, content, itemsJson, url, calendarJson]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setJsonError(null);
     clearError();
+
+    // Calendar tab: parse JSON and call the ingest-calendar Edge Function.
+    if (tab === "calendar") {
+      let parsed;
+      try {
+        parsed = JSON.parse(calendarJson);
+      } catch (err) {
+        setJsonError(`Invalid JSON: ${err.message}`);
+        return;
+      }
+      if (!parsed.owner?.label || !Array.isArray(parsed.events) || parsed.events.length === 0) {
+        setJsonError('Expected { owner: { label }, events: [ … ] }.');
+        return;
+      }
+      setCalSubmitting(true);
+      setCalError(null);
+      setCalResponse(null);
+      try {
+        const resp = await ingestCalendar(parsed);
+        setCalResponse(resp);
+      } catch (err) {
+        setCalError(err.message);
+      } finally {
+        setCalSubmitting(false);
+      }
+      return;
+    }
 
     let payload;
     switch (tab) {
@@ -170,7 +270,7 @@ export default function IngestPage({ onBack, onEnterForest }) {
   };
 
   const createdAny =
-    lastResponse?.results?.some((r) => r.status === "created" || r.status === "merged") ?? false;
+    displayResponse?.results?.some((r) => r.status === "created" || r.status === "merged") ?? false;
 
   return (
     <div className="xp-root rp-root ig-root">
@@ -209,7 +309,7 @@ export default function IngestPage({ onBack, onEnterForest }) {
               role="tab"
               aria-selected={tab === t.key}
               className={`ig-tab ${tab === t.key ? "active" : ""}`}
-              onClick={() => { setTab(t.key); clearResult(); clearError(); setJsonError(null); }}
+              onClick={() => { setTab(t.key); clearAll(); }}
             >
               {t.label}
             </button>
@@ -305,7 +405,40 @@ export default function IngestPage({ onBack, onEnterForest }) {
             </>
           )}
 
-          {/* ── Shared options ──────────────────────────────────── */}
+          {tab === "calendar" && (
+            <>
+              <Field
+                label="Calendar (JSON)"
+                required
+                hint="One person's calendar: { owner, access_class, events:[…] }"
+              >
+                <textarea
+                  className="ig-input ig-textarea ig-mono"
+                  rows={16}
+                  value={calendarJson}
+                  onChange={(e) => { setCalendarJson(e.target.value); setJsonError(null); }}
+                  placeholder='{ "owner": { "label": "Jordan Ellis (Partner)" }, "events": [ … ] }'
+                  spellCheck={false}
+                />
+              </Field>
+              <button
+                type="button"
+                className="ig-link-btn"
+                onClick={() => { setCalendarJson(CALENDAR_EXAMPLE); setJsonError(null); }}
+              >
+                Load example
+              </button>
+              <p className="ig-hint" style={{ marginTop: 8 }}>
+                Each meeting becomes an <code>event</code> in the memory layer (occurred_at = start
+                time) and is linked to its attendees & company. Attendees that already exist in the
+                forest are matched automatically. View the result on the <strong>Calendar</strong> page.
+              </p>
+              {jsonError && <div className="ig-banner error">{jsonError}</div>}
+            </>
+          )}
+
+          {/* ── Shared options (not used by the self-contained Calendar tab) ── */}
+          {tab !== "calendar" && (
           <div className="ig-options">
             <span className="ig-options-lab">Options</span>
             <div className="ig-row">
@@ -327,13 +460,14 @@ export default function IngestPage({ onBack, onEnterForest }) {
               </Field>
             </div>
           </div>
+          )}
 
           <div className="ig-actions">
             <button type="submit" className="xp-btn primary" disabled={!canSubmit}>
-              {isSubmitting ? "Ingesting…" : "Ingest"}
+              {submitting ? "Ingesting…" : "Ingest"}
             </button>
-            {(lastResponse || error) && (
-              <button type="button" className="xp-btn ghost" onClick={() => { clearResult(); clearError(); }}>
+            {(displayResponse || displayError) && (
+              <button type="button" className="xp-btn ghost" onClick={clearAll}>
                 Clear
               </button>
             )}
@@ -341,11 +475,11 @@ export default function IngestPage({ onBack, onEnterForest }) {
         </form>
 
         {/* ── Results ───────────────────────────────────────────── */}
-        {error && <div className="ig-banner error" style={{ marginTop: 20 }}>{error}</div>}
+        {displayError && <div className="ig-banner error" style={{ marginTop: 20 }}>{displayError}</div>}
 
-        {lastResponse && (
+        {displayResponse && (
           <ResultsPanel
-            response={lastResponse}
+            response={displayResponse}
             onEnterForest={createdAny ? onEnterForest : null}
           />
         )}

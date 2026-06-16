@@ -1,5 +1,31 @@
-export default function InfoPanel({ selected, inboundLinks, onSelect, onClose, branchIndex = {} }) {
+import { useState, useEffect } from "react";
+import { supabase } from "../lib/supabase";
+
+export default function InfoPanel({ selected, inboundLinks, onSelect, onClose, branchIndex = {}, onOpenCalendar }) {
   const BRANCH_INDEX = branchIndex;
+
+  // Resolve the people clustered in this branch so each can open a calendar.
+  const [people, setPeople] = useState([]);
+  const pointerIds = selected?.branch?.pointer_ids || [];
+  const branchId = selected?.branch?.id;
+
+  useEffect(() => {
+    if (!supabase || pointerIds.length === 0) {
+      setPeople([]);
+      return;
+    }
+    let cancelled = false;
+    supabase
+      .from("pointers")
+      .select("id,label")
+      .in("id", pointerIds)
+      .eq("type", "person")
+      .order("label")
+      .then(({ data }) => { if (!cancelled) setPeople(data || []); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [branchId]);
+
   if (!selected) return null;
 
   return (
@@ -37,6 +63,22 @@ export default function InfoPanel({ selected, inboundLinks, onSelect, onClose, b
           </div>
         ))}
       </div>
+
+      {people.length > 0 && (
+        <>
+          <div className="panel-label" style={{ marginBottom: 6 }}>People · calendars</div>
+          <div style={{ marginBottom: 14 }}>
+            {people.map((p) => (
+              <div key={p.id}>
+                <button onClick={() => onOpenCalendar && onOpenCalendar(p)} className="link-button">
+                  {"📅 "}
+                  <span style={{ textDecoration: "underline" }}>{p.label}</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {(selected.branch.links || []).length > 0 && (
         <>

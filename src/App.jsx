@@ -9,6 +9,7 @@ const DemoApp = lazy(() => import("./demo/DemoApp"));
 const ExplainerPage = lazy(() => import("./explainer/ExplainerPage"));
 const ResearchPage = lazy(() => import("./explainer/ResearchPage"));
 const IngestPage = lazy(() => import("./ingest/IngestPage"));
+const CalendarPage = lazy(() => import("./calendar/CalendarPage"));
 import Legend from "./components/Legend";
 import InstanceBrowser from "./components/InstanceBrowser";
 import InfoPanel from "./components/InfoPanel";
@@ -22,6 +23,7 @@ import StructureEvolutionAlert from "./components/StructureEvolutionAlert";
 import StatsPanel from "./components/StatsPanel";
 import ChatPanel from "./components/ChatPanel";
 import ClearanceBar from "./components/ClearanceBar";
+import CalendarPanel from "./components/CalendarPanel";
 import "./App.css";
 
 const toolbarBtnStyle = {
@@ -41,7 +43,7 @@ const viewFallback = (
 );
 
 export default function App() {
-  const [view, setView] = useState("story"); // "story" | "forest" | "demo" | "research" | "ingest"
+  const [view, setView] = useState("story"); // "story" | "forest" | "demo" | "research" | "ingest" | "calendar"
 
   if (view === "story") {
     return (
@@ -83,16 +85,25 @@ export default function App() {
     );
   }
 
+  if (view === "calendar") {
+    return (
+      <Suspense fallback={viewFallback}>
+        <CalendarPage onBack={() => setView("forest")} onIngest={() => setView("ingest")} />
+      </Suspense>
+    );
+  }
+
   return (
     <MainApp
       onDemo={() => setView("demo")}
       onStory={() => setView("story")}
       onIngest={() => setView("ingest")}
+      onCalendar={() => setView("calendar")}
     />
   );
 }
 
-function MainApp({ onDemo, onStory, onIngest }) {
+function MainApp({ onDemo, onStory, onIngest, onCalendar }) {
   const { trees, branchIndex, houses, refetch } = useForestData();
   const {
     insertPointer, resolveDuplicate,
@@ -108,6 +119,7 @@ function MainApp({ onDemo, onStory, onIngest }) {
   const [showStats, setShowStats] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [dupeResult, setDupeResult] = useState(null);
+  const [calendarPerson, setCalendarPerson] = useState(null); // { id, label } for the floating CalendarPanel
 
   const {
     canvasRef,
@@ -185,6 +197,12 @@ function MainApp({ onDemo, onStory, onIngest }) {
         onSelect={setInfo}
         onClose={() => setInfo(null)}
         branchIndex={branchIndex}
+        onOpenCalendar={(person) => setCalendarPerson(person)}
+      />
+
+      <CalendarPanel
+        person={calendarPerson}
+        onClose={() => setCalendarPerson(null)}
       />
 
       <HousePanel
@@ -287,6 +305,17 @@ function MainApp({ onDemo, onStory, onIngest }) {
             }}
           >
             Ingest
+          </button>
+          <button
+            onClick={onCalendar}
+            style={{
+              ...toolbarBtnStyle,
+              background: "#2a2440",
+              color: "#fff",
+              border: "1px solid #463c66",
+            }}
+          >
+            Calendar
           </button>
           <button
             onClick={onDemo}

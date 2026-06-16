@@ -28,6 +28,9 @@ export function adaptForest(supabaseTrees) {
       name: b.name,
       leaves: Array.isArray(b.leaves) ? b.leaves : [],
       links: Array.isArray(b.links) ? b.links : [],
+      // Retained so per-branch members (e.g. people) can be resolved for the
+      // calendar feature; unused by buildScene.js.
+      pointer_ids: Array.isArray(b.pointer_ids) ? b.pointer_ids : [],
     })),
   }));
 
