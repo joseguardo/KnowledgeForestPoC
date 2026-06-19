@@ -17,6 +17,9 @@ interface IngestDocumentRequest {
   chunk_size?: number;
   // Access class (security level) for the document, its chunks and the link edge.
   access_class?: string;
+  // Optional namespace folded into the content hash so byte-identical content in
+  // different scopes (e.g. two firms/tenants) does NOT collapse to one pointer.
+  canonical_key_namespace?: string;
   link?: {
     target_id?: string;
     target_canonical_key?: string;
@@ -131,8 +134,10 @@ Deno.serve(async (req: Request) => {
     }
 
     // Content hash as canonical key: byte-identical documents dedup to one
-    // pointer no matter how they arrive (upload, email attachment, re-run).
-    const canonicalKey = `doc:${await sha256(body.content)}`;
+    // pointer no matter how they arrive (upload, email attachment, re-run). An
+    // optional namespace keeps identical content in separate scopes (e.g. two
+    // tenants) from collapsing into one shared pointer.
+    const canonicalKey = `doc:${await sha256((body.canonical_key_namespace || "") + body.content)}`;
     const chunks = chunkContent(body.content, body.chunk_size ?? DEFAULT_CHUNK_SIZE);
 
     const embeddings = await getEmbeddings([
@@ -144,6 +149,14 @@ Deno.serve(async (req: Request) => {
 
     const docClass = body.access_class || "public";
     const docClassId = await resolveClassId(supabase, docClass);
+    // Fail closed: a non-public class that doesn't resolve must NOT silently fall
+    // back to public (that would leak private content). Reject instead.
+    if (docClass !== "public" && docClassId === PUBLIC_CLASS_ID) {
+      return new Response(
+        JSON.stringify({ error: `access_class '${docClass}' does not exist; refusing to fall back to public` }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
     const { data: result, error: rpcError } = await supabase.rpc(
       "insert_pointer_with_dedup",

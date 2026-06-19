@@ -98,6 +98,25 @@ class WebRequest(BaseModel):
     link: LinkSpec | None = None
 
 
+class GmailRequest(BaseModel):
+    subject: str | None = None      # mailbox to impersonate; falls back to settings
+    query: str | None = None        # Gmail search syntax, e.g. "from:x after:2026/01/01"
+    max_results: int | None = None  # falls back to settings.gmail_max_results
+    since_last: bool = False        # recurrent sync: use/advance per-mailbox cursors
+    tenant_id: str | None = None    # scope a run to one firm; omit to sweep all firms
+    access_class: str | None = None
+    link: LinkSpec | None = None
+
+
+class NotionRequest(BaseModel):
+    query: str | None = None         # optional search text; omit for "everything"
+    edited_after: str | None = None  # ISO ts; only pages edited at/after this
+    since_last: bool = False         # use/advance the persisted incremental cursor
+    max_results: int | None = None   # falls back to settings.notion_max_results
+    access_class: str | None = None
+    link: LinkSpec | None = None
+
+
 # ── API response models ────────────────────────────────────────────
 
 

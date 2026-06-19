@@ -106,6 +106,7 @@ class EdgeFunctionClient:
         metadata: dict | None = None,
         chunk_size: int | None = None,
         access_class: str | None = None,
+        canonical_key_namespace: str | None = None,
         link: dict | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"title": title, "content": content}
@@ -117,9 +118,30 @@ class EdgeFunctionClient:
             payload["chunk_size"] = chunk_size
         if access_class:
             payload["access_class"] = access_class
+        if canonical_key_namespace:
+            payload["canonical_key_namespace"] = canonical_key_namespace
         if link:
             payload["link"] = link
         return await self._call("ingest-document", payload)
+
+    async def ingest_email(
+        self,
+        *,
+        tenant_id: str,
+        participants: list[dict[str, Any]],
+        event: dict[str, Any],
+        access_class: str,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "participants": participants,
+            "event": event,
+            "access_class": access_class,
+        }
+        if source:
+            payload["source"] = source
+        return await self._call("ingest-email", payload)
 
     async def ingest_batch(
         self,
