@@ -108,6 +108,14 @@ class GmailRequest(BaseModel):
     link: LinkSpec | None = None
 
 
+class NotesRequest(BaseModel):
+    tenant_id: str | None = None    # scope a run to one firm; omit to sweep all firms
+    since_last: bool = False        # recurrent sync: use/advance the per-tenant cursor
+    max_results: int | None = None  # falls back to settings.notes_max_results
+    access_class: str | None = None
+    link: LinkSpec | None = None
+
+
 class NotionRequest(BaseModel):
     query: str | None = None         # optional search text; omit for "everything"
     edited_after: str | None = None  # ISO ts; only pages edited at/after this

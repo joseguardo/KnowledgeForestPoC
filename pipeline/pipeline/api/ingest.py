@@ -15,6 +15,12 @@ from pipeline.access import (
 from pipeline.adapters.conversation import ConversationAdapter
 from pipeline.adapters.document import DocumentAdapter
 from pipeline.adapters.gmail import EmailThread, GmailAdapter, load_firms
+from pipeline.adapters.notes import (
+    MeetingNote,
+    NotesAdapter,
+    load_notes_firms,
+    slugify,
+)
 try:
     # NOTE(temporary shim): the notion connector source files are missing from
     # this working tree (only their stale .pyc remain) and were never committed,
@@ -45,6 +51,7 @@ from pipeline.models import (
     IngestError,
     IngestResponse,
     LinkSpec,
+    NotesRequest,
     NotionRequest,
     StructuredRequest,
     WebRequest,
@@ -331,6 +338,191 @@ async def _ingest_thread(
         link=link,
     )
     return {"email": email_resp, "doc": doc_resp, "event_id": event_id}
+
+
+@router.post("/notes", response_model=IngestResponse)
+async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
+    """Multi-tenant meeting-notes ingestion. Per firm (tenant), read meeting rows
+    from the source Supabase project and split each into a firm-wide who-met-whom
+    graph (public-within-firm) and a body (notion_summary) that is firm-wide unless
+    the row is Confidential (then private to owner + attendees). Recurrent when
+    `since_last` (per-tenant `last_edited_time` cursor)."""
+    start = time.monotonic()
+    http = request.app.state.http
+    client: EdgeFunctionClient = request.app.state.client
+    adapter = NotesAdapter()
+
+    firms = load_notes_firms(body.tenant_id)
+    # email -> Supabase user id, for granting confidential bodies to participants.
+    user_ids = await resolve_user_ids(http)
+
+    results: list[EdgeFunctionResult] = []
+    errors: list[IngestError] = []
+    produced = 0
+
+    for firm in firms:
+        # Firm-wide class granted to the tenant (idempotent, one-time per firm).
+        firm_class_key = f"firm:{firm.tenant_id}"
+        firm_class_id = await ensure_class(
+            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
+        )
+        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+
+        cursor_key = f"notes:{firm.tenant_id}"
+        since = await get_cursor(http, cursor_key) if body.since_last else None
+
+        try:
+            notes = await adapter.fetch_notes(firm, since=since, max_results=body.max_results)
+        except (AdapterError, ValidationError) as exc:
+            errors.append(_error_from_exc(len(results) + len(errors), exc))
+            continue
+
+        max_edited = _max_iso(since, None)
+        for note in notes:
+            idx = len(results) + len(errors)
+            try:
+                resp = await _ingest_meeting(
+                    http, client, note, firm_class_key, user_ids
+                )
+                produced += 1
+                results.append(
+                    EdgeFunctionResult(
+                        index=idx,
+                        status=resp.get("status", "unknown"),
+                        pointer_id=resp.get("event_id"),
+                        detail=resp,
+                    )
+                )
+            except (
+                AdapterError,
+                EdgeFunctionError,
+                EdgeFunctionTimeout,
+                ValidationError,
+            ) as exc:
+                errors.append(_error_from_exc(idx, exc))
+            max_edited = _max_iso(max_edited, note.last_edited)
+
+        if body.since_last and max_edited:
+            await set_cursor(http, cursor_key, max_edited)
+
+    elapsed = int((time.monotonic() - start) * 1000)
+    return IngestResponse(
+        source_type="notes",
+        items_produced=produced,
+        results=results,
+        errors=errors,
+        duration_ms=elapsed,
+    )
+
+
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    """Larger of two ISO timestamps, comparing as datetimes (offset-safe)."""
+    candidates = []
+    for v in (a, b):
+        if not v:
+            continue
+        try:
+            candidates.append((datetime.fromisoformat(v), v))
+        except ValueError:
+            continue
+    if not candidates:
+        return a or b
+    return max(candidates, key=lambda t: t[0])[1]
+
+
+async def _ingest_meeting(
+    http,
+    client: EdgeFunctionClient,
+    note: MeetingNote,
+    firm_class_key: str,
+    user_ids: dict[str, str],
+) -> dict:
+    """One meeting → firm-wide graph (via ingest-calendar) + body (via
+    ingest-document). Confidential bodies get a private class ensured BEFORE
+    ingest (fail closed) and granted to owner + attendees with accounts."""
+    tenant = note.tenant_id
+
+    start = note.occurred_at or note.last_edited
+    if not start:
+        raise AdapterError(f"Meeting {note.page_id} has no usable date (start/last_edited)")
+
+    # 1. Firm-wide who-met-whom graph (owner + attendees + company + event).
+    owner_key = (
+        f"person::{tenant}::{note.owner_email}"
+        if note.owner_email
+        else f"person::{tenant}::name:{slugify(note.owner_name)}"
+    )
+    owner = {
+        "label": note.owner_name or note.owner_email or "Unknown",
+        "canonical_key": owner_key,
+        "type": "person",
+    }
+    attendees_payload = [
+        {"label": e, "canonical_key": f"person::{tenant}::{e}", "type": "person"}
+        for e in note.attendees
+    ]
+    event: dict = {
+        "title": note.title,
+        "start": start,
+        "canonical_key": f"event:{tenant}:meetingnote:{note.page_id}",
+        "event_type": "meeting",
+        "attendees": attendees_payload,
+    }
+    # Company isolation relies on the firm access class (the dedup class-mismatch
+    # guard keeps each firm's company node separate); ingest-calendar's company
+    # field is label-only, so it carries no tenant in its canonical key.
+    if note.company:
+        event["company"] = note.company
+
+    cal_resp = await client.ingest_calendar(
+        owner=owner,
+        events=[event],
+        access_class=firm_class_key,
+        source="notes",
+    )
+    cal_results = cal_resp.get("results") or []
+    first = cal_results[0] if cal_results else {}
+    event_id = first.get("pointer_id")
+    status = first.get("status", "unknown")
+
+    doc_resp = None
+    if note.body:
+        # 2. Body access class: firm-wide, unless Confidential → private + grants.
+        if note.confidential:
+            body_class = f"meetingnote:{tenant}:{note.page_id}"
+            private_id = await ensure_class(
+                http, body_class, f"Confidential meeting note {note.page_id} (tenant {tenant})"
+            )
+            grant_emails = set(note.attendees)
+            if note.owner_email:
+                grant_emails.add(note.owner_email)
+            for email_addr in grant_emails:
+                uid = user_ids.get(email_addr)
+                if uid:
+                    await ensure_user_grant(http, private_id, uid)
+        else:
+            body_class = firm_class_key
+
+        link = (
+            {
+                "target_id": event_id,
+                "relationship_type": "meeting_notes",
+                "why": "Notes/summary of this meeting",
+            }
+            if event_id
+            else None
+        )
+        doc_resp = await client.ingest_document(
+            title=note.title,
+            content=note.body,
+            occurred_at=start,
+            metadata={"page_id": note.page_id, "confidential": note.confidential},
+            access_class=body_class,
+            canonical_key_namespace=tenant,
+            link=link,
+        )
+
+    return {"calendar": cal_resp, "doc": doc_resp, "event_id": event_id, "status": status}
 
 
 @router.post("/notion", response_model=IngestResponse)

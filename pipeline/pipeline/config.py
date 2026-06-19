@@ -49,6 +49,23 @@ class Settings(BaseSettings):
     # ingest everything regardless of sender.
     gmail_skip_noise_senders: bool = True
 
+    # Notes connector (multi-tenant; reads meeting notes from a *source* Supabase
+    # project over a direct Postgres connection using a least-privilege read-only
+    # role). JSON array, one object per firm, each:
+    #   {"tenant_id": "<uuid>", "source_dsn": "postgresql://forest_notes_reader…",
+    #    "table": "meeting_transcripts"?, "content_fields": ["notion_summary"]?,
+    #    "confidential_field": "confidential"?,
+    #    "owner_map_tables": [{"table": "...", "name_col": "...", "email_col": "..."}]?}
+    # The DSN (with the role password) is the only source credential; it lives in
+    # env/secret, never the DB. Mirrors the GMAIL_FIRMS posture.
+    notes_firms: str | None = None
+    # Single-firm convenience: a bare DSN used when notes_firms is unset. Must be
+    # paired with a tenant_id on the request (or notes_default_tenant_id).
+    notes_source_dsn: str | None = None
+    notes_default_tenant_id: str | None = None
+    # Per-pull cap on meeting rows fetched from one firm.
+    notes_max_results: int = 200
+
     # Notion connector (internal integration token; Bearer auth).
     # notion_api_key is the internal integration secret. Scope is controlled by
     # what's shared with the integration in Notion, not by code.

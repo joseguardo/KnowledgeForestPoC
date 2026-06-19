@@ -143,6 +143,21 @@ class EdgeFunctionClient:
             payload["source"] = source
         return await self._call("ingest-email", payload)
 
+    async def ingest_calendar(
+        self,
+        *,
+        owner: dict[str, Any],
+        events: list[dict[str, Any]],
+        access_class: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"owner": owner, "events": events}
+        if access_class:
+            payload["access_class"] = access_class
+        if source:
+            payload["source"] = source
+        return await self._call("ingest-calendar", payload)
+
     async def ingest_batch(
         self,
         *,
