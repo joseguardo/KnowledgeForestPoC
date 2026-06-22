@@ -4,6 +4,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     supabase_url: str
     supabase_service_role_key: str
+    # Anon (publishable) key — Supabase JWT with role=anon. Needed by the MCP
+    # server to call query-knowledge with the caller's user JWT (apikey header)
+    # and to hit the GoTrue auth endpoints. Shared with the frontend's
+    # VITE_SUPABASE_ANON_KEY.
+    supabase_anon_key: str | None = None
+    # Legacy HS256 JWT signing secret (Dashboard → Settings → API → JWT Settings).
+    # Used by the MCP server to verify Supabase access tokens locally. Optional:
+    # projects that sign with asymmetric keys (ES256/RS256) are verified via the
+    # JWKS endpoint instead, so this can stay unset there.
+    supabase_jwt_secret: str | None = None
 
     default_access_class: str = "public"
     max_content_length: int = 500_000
@@ -105,6 +115,20 @@ class Settings(BaseSettings):
     notion_max_results: int = 100
     # Cap on Markdown pages pulled from a single workspace-export ZIP import.
     notion_export_max_files: int = 5000
+
+    # MCP server (demo). Mounted at {mcp_public_base_url}/api/mcp. We are the
+    # OAuth 2.1 Authorization Server; Supabase (Google provider) is the IdP and
+    # the tokens we hand clients ARE Supabase JWTs. See
+    # pipeline/pipeline/mcp_server/.
+    mcp_public_base_url: str = "http://localhost:8000"
+    # Comma-separated email domains allowed to authenticate via the MCP server
+    # (defence-in-depth, checked at the Supabase callback and per request).
+    mcp_allowed_email_domains: str = "kiboventures.com,nzalpha.com"
+    # Optional override for email→tenant auto-assignment (defaults are baked into
+    # mcp_server/tenant_map.py). JSON array: [{tenant_id, domains[], emails[]}].
+    # On MCP login the user is auto-added to tenant_members for their resolved
+    # tenant (explicit email list wins over domain).
+    mcp_tenant_firms: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

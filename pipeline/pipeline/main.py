@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pipeline.client import EdgeFunctionClient
 from pipeline.config import settings
 from pipeline.errors import AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError
+from pipeline.mcp_server import mcp_lifespan, register_mcp_routes
 
 
 @asynccontextmanager
@@ -23,7 +24,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_retries=settings.max_retries,
         retry_backoff_base=settings.retry_backoff_base,
     )
-    yield
+    # The MCP sub-app is mounted, so its streamable-HTTP session manager must be
+    # run from the parent app's lifespan.
+    async with mcp_lifespan():
+        yield
     await app.state.http.aclose()
 
 
@@ -81,3 +85,7 @@ async def health() -> dict:
 from pipeline.api import ingest  # noqa: E402
 
 app.include_router(ingest.router, prefix="/api/v1/ingest")
+
+# ── MCP server (demo) ──────────────────────────────────────────────
+# FastMCP streamable-HTTP sub-app at /api/mcp (OAuth 2.1; Supabase is the IdP).
+register_mcp_routes(app)

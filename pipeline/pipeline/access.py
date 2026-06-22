@@ -109,6 +109,29 @@ async def ensure_user_grant(http: httpx.AsyncClient, class_id: str, user_id: str
     await _ensure_grant(http, class_id, "user", user_id)
 
 
+async def ensure_tenant_member(
+    http: httpx.AsyncClient, user_id: str, tenant_id: str, role: str = "viewer"
+) -> None:
+    """Idempotently add a user to a tenant. tenant_members has PK
+    (user_id, tenant_id) — ignore duplicates. Grants the user visibility of that
+    tenant's class-gated data via the can_read_class RLS path."""
+    try:
+        resp = await http.post(
+            _rest_url("tenant_members") + "?on_conflict=user_id,tenant_id",
+            headers={**_headers(), "Prefer": "resolution=ignore-duplicates"},
+            json={"user_id": user_id, "tenant_id": tenant_id, "role": role},
+            timeout=settings.web_scrape_timeout,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise AdapterError(
+            f"tenant_members upsert HTTP {exc.response.status_code}: "
+            f"{exc.response.text[:200]}"
+        )
+    except httpx.RequestError as exc:
+        raise AdapterError(f"tenant_members upsert failed: {exc}")
+
+
 async def resolve_pointer_id(http: httpx.AsyncClient, canonical_key: str) -> str | None:
     """Look up an existing pointer's id by canonical_key (service role, bypasses
     RLS). Lets a connector link to an entity ingested in an earlier batch/run."""
