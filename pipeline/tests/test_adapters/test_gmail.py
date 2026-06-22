@@ -15,6 +15,7 @@ from pipeline.adapters.gmail import (
     _is_noise,
     _parse_message,
     _thread_root_id,
+    discover_mailboxes,
     load_firms,
 )
 from pipeline.config import settings
@@ -154,12 +155,47 @@ def test_load_firms_requires_config(monkeypatch):
         load_firms()
 
 
-def test_load_firms_rejects_entry_without_mailboxes(monkeypatch):
+def test_load_firms_rejects_entry_without_mailboxes_or_domain(monkeypatch):
     monkeypatch.setattr(
         settings, "gmail_firms",
         json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": []}]),
     )
-    with pytest.raises(ValidationError, match="no mailboxes"):
+    with pytest.raises(ValidationError, match="no mailboxes and no domain"):
+        load_firms()
+
+
+def test_load_firms_accepts_domain_entry(monkeypatch):
+    """A firm may declare a domain (auto-discovery) instead of an explicit list."""
+    monkeypatch.setattr(settings, "gmail_admin_subject", None)
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([
+            {"tenant_id": "T1", "sa_key_b64": _sa_b64(),
+             "domain": "acme.com", "admin_subject": "admin@acme.com"},
+        ]),
+    )
+    firm = load_firms()[0]
+    assert firm.domain == "acme.com"
+    assert firm.admin_subject == "admin@acme.com"
+    assert firm.mailboxes == []
+
+
+def test_load_firms_domain_admin_subject_falls_back_to_global(monkeypatch):
+    monkeypatch.setattr(settings, "gmail_admin_subject", "admin@global.com")
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "domain": "acme.com"}]),
+    )
+    assert load_firms()[0].admin_subject == "admin@global.com"
+
+
+def test_load_firms_domain_without_admin_subject_rejected(monkeypatch):
+    monkeypatch.setattr(settings, "gmail_admin_subject", None)
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "domain": "acme.com"}]),
+    )
+    with pytest.raises(ValidationError, match="no admin_subject"):
         load_firms()
 
 
@@ -195,6 +231,74 @@ def _thread_handler(messages: dict[str, str]):
         return httpx.Response(404, json={})
 
     return handler
+
+
+# ── adapter: discover_mailboxes (Directory API) ─────────────────────
+
+
+def _domain_firm(monkeypatch, exclude_admin_subject=False):
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(),
+                     "domain": "acme.com", "admin_subject": "admin@acme.com"}]),
+    )
+
+    async def fake_mint(sa_info, subject, scopes):
+        return f"tok-{subject}"
+
+    monkeypatch.setattr(gmail_mod, "_mint_token", fake_mint)
+    monkeypatch.setattr(settings, "gmail_directory_query", None)
+    return load_firms()[0]
+
+
+def _directory_handler(pages: list[dict]):
+    """Serve users.list pages in order, keyed by the request's pageToken."""
+    by_token = {p.get("_token"): p for p in pages}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/users"):
+            return httpx.Response(404, json={})
+        token = request.url.params.get("pageToken")
+        page = by_token.get(token, {})
+        return httpx.Response(200, json={
+            "users": page.get("users", []),
+            **({"nextPageToken": page["next"]} if page.get("next") else {}),
+        })
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_discover_mailboxes_filters_and_excludes(monkeypatch):
+    firm = _domain_firm(monkeypatch)
+    page = {
+        "_token": None,
+        "users": [
+            {"primaryEmail": "alice@acme.com"},
+            {"primaryEmail": "bob@acme.com", "suspended": True},
+            {"primaryEmail": "carol@acme.com", "archived": True},
+            {"primaryEmail": "dave@acme.com"},
+            {"primaryEmail": "nzyme@acme.com"},  # claimed by another firm
+        ],
+    }
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_directory_handler([page])))
+    result = await discover_mailboxes(firm, http, exclude={"NZYME@acme.com"})
+    await http.aclose()
+    # suspended/archived dropped, excluded (case-insensitive) dropped, sorted.
+    assert result == ["alice@acme.com", "dave@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_discover_mailboxes_paginates(monkeypatch):
+    firm = _domain_firm(monkeypatch)
+    pages = [
+        {"_token": None, "users": [{"primaryEmail": "a@acme.com"}], "next": "p2"},
+        {"_token": "p2", "users": [{"primaryEmail": "b@acme.com"}]},
+    ]
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_directory_handler(pages)))
+    result = await discover_mailboxes(firm, http)
+    await http.aclose()
+    assert result == ["a@acme.com", "b@acme.com"]
 
 
 @pytest.mark.asyncio
@@ -383,3 +487,59 @@ async def test_ingest_gmail_manual_pull_defaults_lookback(async_client, monkeypa
     resp = await async_client.post("/api/v1/ingest/gmail", json={"query": "newer_than:2d"})
     assert resp.status_code == 200, resp.text
     assert captured["query"] == "newer_than:2d"
+
+
+@pytest.mark.asyncio
+async def test_ingest_gmail_domain_discovery_carves_out_explicit(async_client, monkeypatch):
+    """A domain firm (kibo) and an explicit-list firm (nzyme) share one Workspace.
+    Discovery for kibo must exclude nzyme's explicitly-claimed mailboxes, and the
+    explicit firm must never trigger discovery."""
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.main import app
+
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([
+            {"tenant_id": "nzyme", "sa_key_b64": _sa_b64(),
+             "mailboxes": ["lead@kiboventures.com"]},
+            {"tenant_id": "kibo", "sa_key_b64": _sa_b64(),
+             "domain": "kiboventures.com", "admin_subject": "admin@kiboventures.com"},
+        ]),
+    )
+
+    seen_exclude: dict[str, frozenset[str] | set[str]] = {}
+
+    async def fake_discover(firm, http, exclude=frozenset()):
+        seen_exclude["exclude"] = exclude
+        # The Workspace holds nzyme's lead plus two genuine kibo people.
+        return [m for m in ["lead@kiboventures.com", "ceo@kiboventures.com",
+                            "cfo@kiboventures.com"] if m.lower() not in exclude]
+
+    monkeypatch.setattr(ingest_mod, "discover_mailboxes", fake_discover)
+
+    fetched: list[tuple[str, str]] = []
+
+    async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
+        fetched.append((firm.tenant_id, subject))
+        return []
+
+    monkeypatch.setattr(GmailAdapter, "fetch_threads", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
+    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
+    app.state.client = AsyncMock()
+
+    resp = await async_client.post("/api/v1/ingest/gmail", json={})
+    assert resp.status_code == 200, resp.text
+
+    # Discovery received nzyme's explicit mailbox as a carve-out.
+    assert "lead@kiboventures.com" in seen_exclude["exclude"]
+
+    # nzyme pulled only its explicit mailbox; kibo only its discovered ones.
+    nzyme_boxes = {m for t, m in fetched if t == "nzyme"}
+    kibo_boxes = {m for t, m in fetched if t == "kibo"}
+    assert nzyme_boxes == {"lead@kiboventures.com"}
+    assert kibo_boxes == {"ceo@kiboventures.com", "cfo@kiboventures.com"}
+    # The two tenants never share a mailbox.
+    assert nzyme_boxes.isdisjoint(kibo_boxes)

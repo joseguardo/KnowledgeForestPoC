@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,11 +11,27 @@ from pipeline.access import (
     ensure_class,
     ensure_tenant_grant,
     ensure_user_grant,
+    resolve_pointer_id,
     resolve_user_ids,
+)
+from pipeline.adapters.affinidad import (
+    AffinidadAdapter,
+    CrmDeal,
+    CrmEdge,
+    CrmEntity,
+    CrmEvent,
+    CrmNote,
+    event_key,
+    load_affinidad_firms,
 )
 from pipeline.adapters.conversation import ConversationAdapter
 from pipeline.adapters.document import DocumentAdapter
-from pipeline.adapters.gmail import EmailThread, GmailAdapter, load_firms
+from pipeline.adapters.gmail import (
+    EmailThread,
+    GmailAdapter,
+    discover_mailboxes,
+    load_firms,
+)
 from pipeline.adapters.notes import (
     MeetingNote,
     NotesAdapter,
@@ -44,6 +61,7 @@ from pipeline.errors import (
     ValidationError,
 )
 from pipeline.models import (
+    AffinidadRequest,
     ConversationRequest,
     DocumentRequest,
     EdgeFunctionResult,
@@ -199,6 +217,13 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
     adapter = GmailAdapter()
 
     firms = load_firms(body.tenant_id)
+    # Carve-out for domain auto-discovery: every mailbox any firm claims
+    # explicitly, across the WHOLE config (not just this run's tenant filter) —
+    # so discovering one tenant's domain never swallows another tenant's
+    # explicitly-listed mailboxes that share the same Workspace.
+    explicit_mailboxes = frozenset(
+        m.lower() for f in load_firms() for m in f.mailboxes
+    )
     # email -> Supabase user id, for granting per-thread private classes.
     user_ids = await resolve_user_ids(http)
 
@@ -214,7 +239,10 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
         )
         await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
 
-        for mailbox in firm.mailboxes:
+        mailboxes = firm.mailboxes or await discover_mailboxes(
+            firm, http, exclude=explicit_mailboxes
+        )
+        for mailbox in mailboxes:
             cursor_key = f"gmail:{firm.tenant_id}:{mailbox}"
             run_started = datetime.now(timezone.utc).isoformat()
             query = body.query
@@ -578,6 +606,340 @@ async def ingest_notion_export(
     return IngestResponse(
         source_type="notion-export",
         items_produced=len(items),
+        results=results,
+        errors=errors,
+        duration_ms=elapsed,
+    )
+
+
+# ── Affinidad (Kibo's in-house CRM) ─────────────────────────────────
+
+_AFFINIDAD_OBJECTS = ["entities", "edges", "deals", "notes", "events"]
+_INGEST_ERRORS = (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError)
+
+
+def _attr_dicts(attrs) -> list[dict]:
+    """(key, value, data_type) tuples → insert-pointer/ingest-batch attribute rows."""
+    return [
+        {"key": k, "value": v, "data_type": dt, "source": "affinidad"}
+        for (k, v, dt) in attrs
+    ]
+
+
+async def _ingest_crm_entity(client: EdgeFunctionClient, ent: CrmEntity, firm_class_key: str) -> dict:
+    """One company/person entity → a pointer (+ its attributes), firm-wide."""
+    return await client.insert_pointer(
+        label=ent.label,
+        type=ent.kind,
+        canonical_key=ent.canonical_key,
+        metadata=ent.metadata,
+        access_class=firm_class_key,
+        attributes=_attr_dicts(ent.attributes) or None,
+    )
+
+
+async def _ingest_crm_edge(client: EdgeFunctionClient, edge: CrmEdge, resolve) -> dict | None:
+    """One entity_edges row → a graph edge, once both endpoints resolve to pointers."""
+    src = await resolve(edge.source_id)
+    tgt = await resolve(edge.target_id)
+    if not src or not tgt:
+        return None
+    return await client.link_pointers(
+        source_id=src,
+        target_id=tgt,
+        relationship_type=edge.relation,
+        why=f"{edge.relation} (from Affinidad CRM)",
+        payload=edge.metadata or None,
+    )
+
+
+async def _apply_deal_attributes(
+    client: EdgeFunctionClient,
+    deal: CrmDeal,
+    entity_by_id: dict[str, CrmEntity],
+    firm_class_key: str,
+) -> dict | None:
+    """A list membership → per-list namespaced attributes upserted on the company
+    pointer (re-inserting by canonical_key returns the existing pointer + upserts
+    attributes_kv via its UNIQUE(pointer_id, key))."""
+    ent = entity_by_id.get(deal.company_id)
+    if ent is None or not deal.attributes:
+        return None
+    return await client.insert_pointer(
+        label=ent.label,
+        type="company",
+        canonical_key=ent.canonical_key,
+        access_class=firm_class_key,
+        attributes=_attr_dicts(deal.attributes),
+    )
+
+
+async def _ingest_crm_note(
+    http,
+    client: EdgeFunctionClient,
+    note: CrmNote,
+    firm_class_key: str,
+    user_ids: dict[str, str],
+    resolve_link,
+) -> dict:
+    """One note → a document, firm-wide unless private (then a per-note class
+    ensured + granted to the author BEFORE ingest), plus note_about edges to each
+    linked entity that resolves to a pointer."""
+    if note.private:
+        body_class = f"affinidadnote:{note.tenant_id}:{note.note_id}"
+        class_id = await ensure_class(
+            http, body_class, f"Private CRM note {note.note_id} (tenant {note.tenant_id})"
+        )
+        if note.author_email:
+            uid = user_ids.get(note.author_email)
+            if uid:
+                await ensure_user_grant(http, class_id, uid)
+    else:
+        body_class = firm_class_key
+
+    doc = await client.ingest_document(
+        title=note.label,
+        content=note.body,
+        occurred_at=note.occurred_at,
+        metadata={
+            "source": "affinidad",
+            "note_id": note.note_id,
+            "visibility": "private" if note.private else "org",
+        },
+        access_class=body_class,
+        canonical_key_namespace=note.tenant_id,
+    )
+    doc_id = doc.get("pointer_id")
+    if doc_id:
+        for (entity_type, entity_id) in note.links:
+            tgt = await resolve_link(entity_type, entity_id)
+            if tgt:
+                await client.link_pointers(
+                    source_id=doc_id,
+                    target_id=tgt,
+                    relationship_type="note_about",
+                    why="Note about this entity",
+                )
+    return doc
+
+
+async def _ingest_crm_event(
+    http,
+    client: EdgeFunctionClient,
+    ev: CrmEvent,
+    firm_class_key: str,
+    user_ids: dict[str, str],
+    resolve,
+    entity_by_id: dict[str, CrmEntity],
+) -> dict:
+    """One interaction → a firm-wide event pointer (the fact: who/when/type) +
+    participant edges (preserving the source role), and — if there's body text —
+    a participant-only document linked to the event (fail-closed: the per-event
+    class is ensured + granted to participant users before the body is ingested)."""
+    pointer = await client.insert_pointer(
+        label=ev.label,
+        type="event",
+        canonical_key=event_key(ev.tenant_id, ev.event_id),
+        metadata=ev.metadata,
+        occurred_at=ev.occurred_at,
+        access_class=firm_class_key,
+    )
+    event_id = pointer.get("pointer_id")
+
+    for (entity_type, entity_id, role) in ev.participants:
+        pid = await resolve(entity_id)
+        if pid and event_id:
+            await client.link_pointers(
+                source_id=pid,
+                target_id=event_id,
+                relationship_type=role,
+                why=f"{role} of this {ev.type}",
+            )
+
+    if ev.body:
+        body_class = f"affinidadevent:{ev.tenant_id}:{ev.event_id}"
+        class_id = await ensure_class(
+            http, body_class,
+            f"Participant-only {ev.type} body {ev.event_id} (tenant {ev.tenant_id})",
+        )
+        for (_etype, entity_id, _role) in ev.participants:
+            ent = entity_by_id.get(entity_id)
+            email = getattr(ent, "email", None) if ent else None
+            uid = user_ids.get(email) if email else None
+            if uid:
+                await ensure_user_grant(http, class_id, uid)
+        rel = "email_content" if ev.type == "email" else "meeting_notes"
+        link = (
+            {"target_id": event_id, "relationship_type": rel, "why": f"Body of this {ev.type}"}
+            if event_id
+            else None
+        )
+        # Email subjects are participant-only, so they live in the private body, not
+        # the org-wide node label.
+        content = f"{ev.subject}\n\n{ev.body}" if ev.subject else ev.body
+        await client.ingest_document(
+            title=ev.subject or ev.label,
+            content=content,
+            occurred_at=ev.occurred_at,
+            metadata={"source": "affinidad", "event_id": ev.event_id, "event_type": ev.type},
+            access_class=body_class,
+            canonical_key_namespace=ev.tenant_id,
+            link=link,
+        )
+    return pointer
+
+
+@router.post("/affinidad", response_model=IngestResponse)
+async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestResponse:
+    """One-time historical backfill of Kibo's in-house CRM ("Affinidad") into the
+    graph. Per firm (tenant): companies/people → pointers, entity_edges → edges,
+    list memberships → namespaced company attributes ("deals"), notes → documents
+    (org or author-private), and interactions → event pointers + participant edges
+    with a participant-only body document. Idempotent (canonical-key dedup). Order
+    is entities → edges → deals → notes → events so endpoints exist before linking.
+    `objects` restricts a run to specific types (staged backfill of large events)."""
+    start = time.monotonic()
+    http = request.app.state.http
+    client: EdgeFunctionClient = request.app.state.client
+    adapter = AffinidadAdapter()
+
+    firms = load_affinidad_firms(body.tenant_id)
+    user_ids = await resolve_user_ids(http)
+    objects = set(body.objects or _AFFINIDAD_OBJECTS)
+
+    results: list[EdgeFunctionResult] = []
+    errors: list[IngestError] = []
+    produced = 0
+
+    def _ok(resp: dict | None) -> None:
+        nonlocal produced
+        produced += 1
+        results.append(
+            EdgeFunctionResult(
+                index=len(results) + len(errors),
+                status=(resp or {}).get("status", "unknown"),
+                pointer_id=(resp or {}).get("pointer_id"),
+                detail=resp,
+            )
+        )
+
+    def _fail(exc: Exception) -> None:
+        errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+    for firm in firms:
+        firm_class_key = f"firm:{firm.tenant_id}"
+        firm_class_id = await ensure_class(
+            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
+        )
+        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+
+        # Always load entities (cheap) to resolve edges/notes/events to pointers,
+        # even when this run only ingests downstream objects.
+        try:
+            entities = await adapter.fetch_entities(firm)
+        except _INGEST_ERRORS as exc:
+            _fail(exc)
+            continue
+        entity_by_id = {e.entity_id: e for e in entities}
+        ptr_by_entity: dict[str, str] = {}
+        pid_cache: dict[str, str | None] = {}
+
+        async def resolve(entity_id: str):
+            if entity_id in ptr_by_entity:
+                return ptr_by_entity[entity_id]
+            if entity_id in pid_cache:
+                return pid_cache[entity_id]
+            ent = entity_by_id.get(entity_id)
+            pid = await resolve_pointer_id(http, ent.canonical_key) if ent else None
+            pid_cache[entity_id] = pid
+            return pid
+
+        async def resolve_link(entity_type: str, entity_id: str):
+            if entity_type in ("company", "person"):
+                return await resolve(entity_id)
+            if entity_type == "event":
+                key = f"evt:{entity_id}"
+                if key not in pid_cache:
+                    pid_cache[key] = await resolve_pointer_id(
+                        http, event_key(firm.tenant_id, entity_id)
+                    )
+                return pid_cache[key]
+            return None  # 'meeting' legacy-shim ids are covered via events
+
+        sem = asyncio.Semaphore(settings.affinidad_concurrency)
+
+        async def _run(items, worker) -> None:
+            """Run `worker(item)` for every item with bounded concurrency, recording
+            each result/error. Safe: canonical-key dedup is a transactional upsert."""
+            async def guarded(item):
+                async with sem:
+                    try:
+                        resp = await worker(item)
+                        if resp is not None:
+                            _ok(resp)
+                    except _INGEST_ERRORS as exc:
+                        _fail(exc)
+            await asyncio.gather(*(guarded(i) for i in items))
+
+        async def _do_entity(ent):
+            resp = await _ingest_crm_entity(client, ent, firm_class_key)
+            pid = resp.get("pointer_id")
+            if pid:
+                ptr_by_entity[ent.entity_id] = pid
+            return resp
+
+        if "entities" in objects:
+            await _run(entities, _do_entity)
+
+        if "edges" in objects:
+            try:
+                edges = await adapter.fetch_edges(firm)
+            except _INGEST_ERRORS as exc:
+                edges = []
+                _fail(exc)
+            await _run(edges, lambda edge: _ingest_crm_edge(client, edge, resolve))
+
+        if "deals" in objects:
+            try:
+                deals = await adapter.fetch_deals(firm)
+            except _INGEST_ERRORS as exc:
+                deals = []
+                _fail(exc)
+            await _run(
+                deals,
+                lambda deal: _apply_deal_attributes(client, deal, entity_by_id, firm_class_key),
+            )
+
+        if "notes" in objects:
+            try:
+                notes = await adapter.fetch_notes(firm)
+            except _INGEST_ERRORS as exc:
+                notes = []
+                _fail(exc)
+            await _run(
+                notes,
+                lambda note: _ingest_crm_note(
+                    http, client, note, firm_class_key, user_ids, resolve_link
+                ),
+            )
+
+        if "events" in objects:
+            try:
+                events = await adapter.fetch_events(firm, max_results=body.max_results)
+            except _INGEST_ERRORS as exc:
+                events = []
+                _fail(exc)
+            await _run(
+                events,
+                lambda ev: _ingest_crm_event(
+                    http, client, ev, firm_class_key, user_ids, resolve, entity_by_id
+                ),
+            )
+
+    elapsed = int((time.monotonic() - start) * 1000)
+    return IngestResponse(
+        source_type="affinidad",
+        items_produced=produced,
         results=results,
         errors=errors,
         duration_ms=elapsed,

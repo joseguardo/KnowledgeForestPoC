@@ -116,6 +116,15 @@ class NotesRequest(BaseModel):
     link: LinkSpec | None = None
 
 
+class AffinidadRequest(BaseModel):
+    tenant_id: str | None = None    # scope a run to one firm; omit to sweep all firms
+    since_last: bool = False        # recurrent sync (deferred): use/advance the events cursor
+    max_results: int | None = None  # cap on events fetched; falls back to settings
+    # Restrict a run to specific object types (for staged backfill of the large
+    # events table). Omit/empty = all. Values ∈ entities|edges|deals|notes|events.
+    objects: list[str] | None = None
+
+
 class NotionRequest(BaseModel):
     query: str | None = None         # optional search text; omit for "everything"
     edited_after: str | None = None  # ISO ts; only pages edited at/after this

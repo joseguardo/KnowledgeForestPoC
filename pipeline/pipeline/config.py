@@ -36,11 +36,26 @@ class Settings(BaseSettings):
     gmail_delegated_subjects: str | None = None
     gmail_max_results: int = 25
     gmail_scopes: str = "https://www.googleapis.com/auth/gmail.readonly"
+    # Optional mailbox auto-discovery: when a firm entry declares a `domain`
+    # instead of an explicit `mailboxes` list, the connector enumerates that
+    # Workspace's users via the Admin Directory API. The directory scope must be
+    # DWD-authorized on the same client ID, and the call impersonates an admin
+    # (`admin_subject` on the firm, else this global default).
+    gmail_directory_scope: str = (
+        "https://www.googleapis.com/auth/admin.directory.user.readonly"
+    )
+    gmail_admin_subject: str | None = None
+    gmail_directory_query: str | None = None
     # Multi-tenant connector config. JSON array of per-firm objects, each:
-    #   {"tenant_id": "<uuid>", "sa_key_b64": "<base64 SA JSON>",
-    #    "mailboxes": ["a@firm.com", ...], "scopes": "<space-separated>"?}
-    # Each firm = one tenant with its own Google Workspace + service account +
-    # domain-wide delegation. SA keys stay in env/secret, never the DB.
+    #   {"tenant_id": "<uuid>",
+    #    "mailboxes": ["a@firm.com", ...]   # explicit list, OR
+    #    "domain": "firm.com",              # auto-discover via Directory API
+    #    "admin_subject": "admin@firm.com"? # admin to impersonate for discovery
+    #    "sa_key_b64": "<base64 SA JSON>"?  # else falls back to the global SA
+    #    "scopes": "<space-separated>"?}
+    # Each entry needs either mailboxes or a domain. One shared SA typically
+    # serves every tenant (DWD-authorized per Workspace). SA keys stay in
+    # env/secret, never the DB.
     gmail_firms: str | None = None
     # First-run backfill window (days) for recurrent per-mailbox sync.
     gmail_backfill_days: int = 7
@@ -65,6 +80,22 @@ class Settings(BaseSettings):
     notes_default_tenant_id: str | None = None
     # Per-pull cap on meeting rows fetched from one firm.
     notes_max_results: int = 200
+
+    # Affinidad connector (Kibo's single-tenant in-house CRM). Reads the CRM's
+    # Supabase Postgres directly over a least-privilege read-only role, same
+    # posture as the Notes connector. Affinidad has no tenant_id of its own, so a
+    # firm here is just {tenant_id (assigned on the memory side), source_dsn}.
+    # JSON array form for future multi-firm use:
+    #   [{"tenant_id": "<uuid>", "source_dsn": "postgresql://forest_crm_reader…"}]
+    affinidad_firms: str | None = None
+    # Single-firm convenience (the normal case): a bare DSN + the tenant to attach.
+    affinidad_source_dsn: str | None = None
+    affinidad_default_tenant_id: str | None = None
+    # Per-pull cap on rows fetched from the large `events` table during backfill.
+    affinidad_max_results: int = 50_000
+    # Max in-flight edge-function calls per object stage (backfill throughput).
+    # Safe because canonical-key dedup is a transactional upsert.
+    affinidad_concurrency: int = 8
 
     # Notion connector (internal integration token; Bearer auth).
     # notion_api_key is the internal integration secret. Scope is controlled by

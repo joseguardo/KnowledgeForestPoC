@@ -18,6 +18,7 @@ from pipeline.config import settings
 from pipeline.errors import AdapterError, ValidationError
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+DIRECTORY_API_BASE = "https://admin.googleapis.com/admin/directory/v1"
 _RE_PREFIX = re.compile(r"^\s*(re|fwd|fw)\s*:\s*", re.IGNORECASE)
 
 # Automated / non-human senders that should NOT become person entities. They
@@ -34,12 +35,19 @@ _NOISE_LOCALPARTS = re.compile(
 
 @dataclass
 class GmailFirm:
-    """One firm = one tenant with its own Google Workspace + service account."""
+    """One firm = one tenant with its own Google Workspace + service account.
+
+    Mailboxes are either listed explicitly (`mailboxes`) or auto-discovered from
+    `domain` via the Admin Directory API at ingest time (impersonating
+    `admin_subject`). Exactly one of the two is required per firm.
+    """
 
     tenant_id: str
     sa_info: dict[str, Any]
     mailboxes: list[str]
     scopes: str
+    domain: str | None = None
+    admin_subject: str | None = None
 
 
 @dataclass
@@ -87,8 +95,22 @@ def load_firms(tenant_id: str | None = None) -> list[GmailFirm]:
         if not tid:
             raise ValidationError("GMAIL_FIRMS entry missing tenant_id")
         mailboxes = [m.strip() for m in (entry.get("mailboxes") or []) if m.strip()]
-        if not mailboxes:
-            raise ValidationError(f"GMAIL_FIRMS entry for {tid} has no mailboxes")
+        domain = str(entry.get("domain") or "").strip() or None
+        # A firm supplies its mailbox set one of two ways: an explicit list, or a
+        # domain to auto-discover. Auto-discovery impersonates a Workspace admin.
+        if not mailboxes and not domain:
+            raise ValidationError(
+                f"GMAIL_FIRMS entry for {tid} has no mailboxes and no domain"
+            )
+        admin_subject = (
+            str(entry.get("admin_subject") or "").strip()
+            or settings.gmail_admin_subject
+        )
+        if domain and not mailboxes and not admin_subject:
+            raise ValidationError(
+                f"GMAIL_FIRMS entry for {tid} uses domain discovery but has no "
+                "admin_subject (set its admin_subject or GMAIL_ADMIN_SUBJECT)"
+            )
         # One service account typically serves every tenant (its client ID is
         # DWD-authorized in each firm's Workspace). Resolve the key per entry,
         # else fall back to the global GMAIL_SA_KEY_B64 / GMAIL_SA_KEY_JSON.
@@ -108,6 +130,8 @@ def load_firms(tenant_id: str | None = None) -> list[GmailFirm]:
                 sa_info=sa_info,
                 mailboxes=mailboxes,
                 scopes=(entry.get("scopes") or settings.gmail_scopes),
+                domain=domain,
+                admin_subject=admin_subject,
             )
         )
     if tenant_id and not firms:
@@ -183,6 +207,46 @@ async def _mint_token(sa_info: dict[str, Any], subject: str, scopes: str) -> str
         return creds.token
 
     return await asyncio.to_thread(_refresh)
+
+
+async def discover_mailboxes(
+    firm: GmailFirm,
+    http: httpx.AsyncClient,
+    exclude: frozenset[str] | set[str] = frozenset(),
+) -> list[str]:
+    """Enumerate active mailboxes in `firm.domain` via the Admin Directory API.
+
+    Impersonates `firm.admin_subject` (an admin) with the directory scope, pages
+    through users.list, drops suspended/archived accounts, and removes any
+    address in `exclude` (mailboxes another firm has claimed explicitly, so a
+    shared-Workspace tenant isn't swept into the wrong graph). Returns the sorted,
+    de-duplicated primary emails.
+    """
+    token = await _mint_token(
+        firm.sa_info, firm.admin_subject, settings.gmail_directory_scope
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    excluded = {e.lower() for e in exclude}
+
+    emails: set[str] = set()
+    page_token: str | None = None
+    while True:
+        params: dict[str, Any] = {"domain": firm.domain, "maxResults": 500}
+        if settings.gmail_directory_query:
+            params["query"] = settings.gmail_directory_query
+        if page_token:
+            params["pageToken"] = page_token
+        data = await _get(http, f"{DIRECTORY_API_BASE}/users", headers, params)
+        for user in data.get("users", []):
+            if user.get("suspended") or user.get("archived"):
+                continue
+            primary = (user.get("primaryEmail") or "").strip()
+            if primary and primary.lower() not in excluded:
+                emails.add(primary)
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return sorted(emails)
 
 
 async def _list_thread_ids(

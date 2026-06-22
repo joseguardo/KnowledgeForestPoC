@@ -158,6 +158,27 @@ class EdgeFunctionClient:
             payload["source"] = source
         return await self._call("ingest-calendar", payload)
 
+    async def link_pointers(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        relationship_type: str | None = None,
+        why: str | None = None,
+        payload: dict | None = None,
+        weight: float | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"source_id": source_id, "target_id": target_id}
+        if relationship_type:
+            body["relationship_type"] = relationship_type
+        if why:
+            body["why"] = why
+        if payload:
+            body["payload"] = payload
+        if weight is not None:
+            body["weight"] = weight
+        return await self._call("link-pointers", body)
+
     async def ingest_batch(
         self,
         *,

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import httpx
 
@@ -134,6 +136,32 @@ async def test_network_error_then_success():
     result = await client.insert_pointer(label="X", type="company")
     assert result["status"] == "created"
     assert call_count == 2
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_link_pointers_posts_edge_payload():
+    captured = {}
+
+    def handler(req: httpx.Request):
+        captured["url"] = str(req.url)
+        captured["json"] = json.loads(req.content)
+        return httpx.Response(200, json={"status": "linked", "edge_id": "e-1"})
+
+    transport = httpx.MockTransport(handler)
+    http, client = _make_client(transport)
+    result = await client.link_pointers(
+        source_id="s-1", target_id="t-1", relationship_type="works_at",
+        why="Ana works at Acme", payload={"role": "Partner"},
+    )
+    assert result["status"] == "linked"
+    assert captured["url"].endswith("/functions/v1/link-pointers")
+    body = captured["json"]
+    assert body["source_id"] == "s-1"
+    assert body["target_id"] == "t-1"
+    assert body["relationship_type"] == "works_at"
+    assert body["why"] == "Ana works at Acme"
+    assert body["payload"] == {"role": "Partner"}
     await http.aclose()
 
 
