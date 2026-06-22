@@ -27,7 +27,7 @@ async def query_knowledge(
     mode: Annotated[
         Literal["search", "answer", "explore"],
         Field(description="search = raw matches, answer = composed answer, explore = graph walk."),
-    ] = "answer",
+    ] = "search",
 ) -> dict[str, Any]:
     """Search your knowledge graph. Runs under your identity — results are
     filtered by the access-control gate, so you only ever see what you're
