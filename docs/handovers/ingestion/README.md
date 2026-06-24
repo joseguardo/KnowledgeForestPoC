@@ -1,0 +1,45 @@
+# Ingestion — handover
+
+How raw sources become the knowledge graph. One intermediate contract, one typed
+graph, deterministic extraction (no LLM), transactional dedup.
+
+## The shared model
+
+Every adapter normalizes to `NormalizedItem` (`pipeline/pipeline/models.py`) —
+`kind = pointer | document` — and writes into one graph (Supabase project
+**KnowledgeForest**, `sjiepibqadbdowcizccw`):
+
+| Table | Role | Key fields |
+|---|---|---|
+| `pointers` | nodes | `type` (company/person/event/document/…), `canonical_key` (unique = identity), `label`, `occurred_at`, `access_class_id` |
+| `edges` | relationships | `source_id`, `target_id`, `relationship_type`, `why`, `weight`; unique `(source,target,type)` |
+| `attributes_kv` | facts | `(pointer_id, key)` unique → upsert; `value`, `data_type` |
+| `document_chunks` | bodies | `(pointer_id, sequence)`; per-chunk embedding + access |
+
+**Identity & dedup:** the `insert_pointer_with_dedup` RPC merges on a matching
+`canonical_key`; trigram+embedding similarity only flags lookalikes for review.
+**Access:** every row carries an `access_class_id`; `can_read_class()` RLS gates
+on `public` / per-user grant / per-tenant grant. Class keys: `firm:{tenant}`
+(public-within-firm) and per-record private keys.
+
+## Sources
+
+- **Gmail** — Workspace threads (`adapters/gmail.py`). See [emails.md](emails.md).
+- **Notes** — `meeting_transcripts` from a source Supabase (`adapters/notes.py`).
+  See [notes.md](notes.md).
+- **Affinidad** — Kibo's in-house CRM Postgres (`adapters/affinidad.py`); the
+  authority on companies (domains + names).
+- **Document / Web / Conversation / Structured** — single documents or explicit
+  pointers (`adapters/{document,web,conversation,structured}.py`).
+
+A visual version of this overview (schemas, per-source cards, extraction modes)
+is published as a Claude artifact; ask for the link.
+
+## Known problems (2026-06)
+
+- **Companies typed as `person`** — Gmail/Notes had no person/company logic; every
+  address became a `person`. **Fixed** for both: Gmail (emails.md) and Notes
+  (notes.md) now share `classify_address`. Other sources unaffected.
+- **Bare-email labels** — 36% of person nodes were labelled with the email, not a
+  name. Two causes: under-captured header display names, and the dedup `merged`
+  branch never upgrading a label. Tracked for step 4.

@@ -34,6 +34,39 @@ def _headers() -> dict[str, str]:
     }
 
 
+async def add_thread_members(
+    http: httpx.AsyncClient,
+    tenant_id: str,
+    thread_id: str,
+    user_ids: set[str] | list[str],
+) -> None:
+    """Grant the given Supabase users read access to an email thread's bodies by
+    upserting (tenant_id, thread_id, user_id) rows into thread_membership. The
+    private `email_body` documents are gated by membership (can_read_thread), not
+    per-thread access classes. Idempotent (composite PK); no-op on empty."""
+    rows = [
+        {"tenant_id": tenant_id, "thread_id": thread_id, "user_id": uid}
+        for uid in {u for u in user_ids if u}
+    ]
+    if not rows:
+        return
+    try:
+        resp = await http.post(
+            _rest_url("thread_membership") + "?on_conflict=tenant_id,thread_id,user_id",
+            headers={**_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json=rows,
+            timeout=settings.web_scrape_timeout,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise AdapterError(
+            f"thread_membership upsert HTTP {exc.response.status_code}: "
+            f"{exc.response.text[:200]}"
+        )
+    except httpx.RequestError as exc:
+        raise AdapterError(f"thread_membership upsert failed: {exc}")
+
+
 async def ensure_class(http: httpx.AsyncClient, key: str, description: str) -> str:
     """Idempotently create the access class `key` and return its id. access_classes
     has a UNIQUE(key), so this upserts on conflict and reads the id back."""

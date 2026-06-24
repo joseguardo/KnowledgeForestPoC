@@ -5,26 +5,31 @@ import base64
 import email
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
+from datetime import timezone
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 
 import httpx
 
-from pipeline.adapters.document import _extract_email, _validate_content
+from pipeline.adapters.document import _extract_email
 from pipeline.config import settings
 from pipeline.errors import AdapterError, ValidationError
 
+log = logging.getLogger(__name__)
+
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 DIRECTORY_API_BASE = "https://admin.googleapis.com/admin/directory/v1"
-_RE_PREFIX = re.compile(r"^\s*(re|fwd|fw)\s*:\s*", re.IGNORECASE)
 
 # Automated / non-human senders that should NOT become person entities. They
 # stay in the event metadata only, keeping the who-contacted-whom graph clean.
+# Matched anywhere in the local-part (word-bounded), so e.g. "comments-noreply"
+# and "bounce+tag" are caught, not just addresses that start with the word.
 _NOISE_LOCALPARTS = re.compile(
-    r"^(no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|mailer-daemon|postmaster|"
+    r"\b(no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|mailer-daemon|postmaster|"
     r"bounce|bounces|notifications?|notify|alerts?|automated|auto|noreply)\b",
     re.IGNORECASE,
 )
@@ -51,25 +56,24 @@ class GmailFirm:
 
 
 @dataclass
-class ThreadParticipant:
-    email: str
-    name: str | None
-    role: str  # "from" | "to" | "cc"
+class EmailMessage:
+    """One message within a thread — the atomic unit of the step-1 rebuild.
 
-
-@dataclass
-class EmailThread:
-    """One Gmail thread, normalized for the public-graph + private-body split."""
+    Identity is the RFC822 Message-ID (fallback synthetic hash); `thread_id`
+    groups messages of the same conversation. Entity classification and
+    direction are applied later in the orchestration layer (they need run
+    context: CRM domains, own domains, correspondence)."""
 
     tenant_id: str
     mailbox: str
-    gmail_thread_id: str
-    thread_hash: str  # sha256(References-chain root Message-ID); stable cross-mailbox
-    participants: list[ThreadParticipant]  # real people only (noise filtered)
-    event_label: str  # subject-free
+    message_id: str
+    thread_id: str
     occurred_at: str | None
-    metadata: dict[str, Any]
-    body: str  # private content: subject(s) + bodies
+    sender: tuple[str, str | None]          # (email, display name)
+    to: list[tuple[str, str | None]]
+    cc: list[tuple[str, str | None]]
+    subject: str                            # private (used in a later body step)
+    body: str                               # private (used in a later body step)
 
 
 def load_firms(tenant_id: str | None = None) -> list[GmailFirm]:
@@ -165,30 +169,39 @@ def _load_sa_info_json(raw: str) -> dict[str, Any]:
 
 
 class GmailAdapter:
-    """Fetches Gmail threads for one firm mailbox via domain-wide delegation and
-    normalizes each into an EmailThread (public communication graph + private
-    body). Orchestration of class/grant provisioning and ingestion lives in the
-    API layer, since it spans several edge-function calls per thread."""
+    """Fetches Gmail messages for one firm mailbox via domain-wide delegation and
+    flattens each thread into per-message `EmailMessage` records. Orchestration of
+    class/grant provisioning and graph writes lives in the API layer."""
 
-    async def fetch_threads(
+    async def fetch_messages(
         self,
         firm: GmailFirm,
         subject: str,
         http: httpx.AsyncClient,
         query: str | None = None,
         max_results: int | None = None,
-    ) -> list[EmailThread]:
+    ) -> list[EmailMessage]:
+        """Step-1 path: fetch threads and flatten to per-message records.
+
+        Mints a DWD token, lists thread ids, fetches each thread's messages, and
+        emits one `EmailMessage` per message. Entity classification/direction are
+        applied later in the orchestration layer (CRM + own-domain context)."""
         token = await _mint_token(firm.sa_info, subject, firm.scopes)
         headers = {"Authorization": f"Bearer {token}"}
         cap = max_results or settings.gmail_max_results
         thread_ids = await _list_thread_ids(http, headers, query, cap)
 
-        threads: list[EmailThread] = []
+        out: list[EmailMessage] = []
         for thread_id in thread_ids:
-            thread = await _thread_to_email(http, headers, thread_id, firm.tenant_id, subject)
-            if thread is not None:
-                threads.append(thread)
-        return threads
+            try:
+                parsed = await _fetch_thread_parsed(http, headers, thread_id)
+            except (AdapterError, ValidationError) as exc:
+                log.warning("skipping gmail thread %s for %s: %s", thread_id, subject, exc)
+                continue
+            out.extend(
+                messages_from_thread(parsed, tenant_id=firm.tenant_id, mailbox=subject)
+            )
+        return out
 
 
 async def _mint_token(sa_info: dict[str, Any], subject: str, scopes: str) -> str:
@@ -255,28 +268,45 @@ async def _list_thread_ids(
     query: str | None,
     max_results: int,
 ) -> list[str]:
-    params: dict[str, Any] = {"maxResults": max_results}
-    if query:
-        params["q"] = query
-    data = await _get(http, f"{GMAIL_API_BASE}/threads", headers, params)
-    return [t["id"] for t in data.get("threads", []) if t.get("id")][:max_results]
+    """Collect up to `max_results` thread IDs, following nextPageToken.
+
+    Gmail caps a single threads.list page at 500, so a full-history backfill
+    needs to page. `max_results` is the total cap across pages; `gmail_max_pages`
+    bounds the loop so a huge query can't run away.
+    """
+    ids: list[str] = []
+    page_token: str | None = None
+    for _ in range(settings.gmail_max_pages):
+        remaining = max_results - len(ids)
+        if remaining <= 0:
+            break
+        params: dict[str, Any] = {"maxResults": min(500, remaining)}
+        if query:
+            params["q"] = query
+        if page_token:
+            params["pageToken"] = page_token
+        data = await _get(http, f"{GMAIL_API_BASE}/threads", headers, params)
+        ids.extend(t["id"] for t in data.get("threads", []) if t.get("id"))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return ids[:max_results]
 
 
-async def _thread_to_email(
+async def _fetch_thread_parsed(
     http: httpx.AsyncClient,
     headers: dict[str, str],
     thread_id: str,
-    tenant_id: str,
-    mailbox: str,
-) -> EmailThread | None:
-    # threads.get only supports full/metadata/minimal — NOT raw. Enumerate
-    # message IDs minimally, then pull each as raw RFC822 and reuse the parser.
+) -> list[dict[str, Any]]:
+    """Fetch a thread and parse each message to the `_parse_message` dict form.
+
+    threads.get only supports full/metadata/minimal — not raw — so enumerate
+    message IDs minimally, then pull each as raw RFC822 and parse. Bad messages
+    are skipped, not fatal."""
     data = await _get(
         http, f"{GMAIL_API_BASE}/threads/{thread_id}", headers, {"format": "minimal"}
     )
-
     parsed_msgs: list[dict[str, Any]] = []
-    sections: list[str] = []
     for msg in data.get("messages", []):
         msg_id = msg.get("id")
         if not msg_id:
@@ -288,95 +318,29 @@ async def _thread_to_email(
         if not raw:
             continue
         try:
-            parsed = _parse_message(base64.urlsafe_b64decode(raw))
+            parsed_msgs.append(_parse_message(base64.urlsafe_b64decode(raw)))
         except (AdapterError, ValueError):
             continue
-        parsed_msgs.append(parsed)
+    return parsed_msgs
 
-        header_block = "\n".join(
-            line
-            for line in (
-                f"From: {parsed['from']}" if parsed["from"] else "",
-                f"To: {parsed['to']}" if parsed["to"] else "",
-                f"Date: {parsed['occurred_at']}" if parsed["occurred_at"] else "",
-                f"Subject: {parsed['subject']}",
-            )
-            if line
-        )
-        sections.append(f"{header_block}\n\n{parsed['body']}")
 
-    if not parsed_msgs:
-        return None
+def _utf16_len(s: str) -> int:
+    """Length in UTF-16 code units — what JS String.length (and the
+    ingest-document edge function's content check) counts."""
+    return len(s.encode("utf-16-le")) // 2
 
-    root_id = _thread_root_id(parsed_msgs)
-    if not root_id:
-        return None
-    thread_hash = hashlib.sha256(root_id.encode("utf-8")).hexdigest()[:32]
 
-    # Participants by role across the whole thread.
-    by_role: dict[str, list[tuple[str, str]]] = {"from": [], "to": [], "cc": []}
-    seen: set[tuple[str, str]] = set()
-    for m in parsed_msgs:
-        for role, header in (("from", "from"), ("to", "to"), ("cc", "cc")):
-            for name, addr in getaddresses([m[header]] if m[header] else []):
-                addr = addr.strip().lower()
-                if not addr or (role, addr) in seen:
-                    continue
-                seen.add((role, addr))
-                by_role[role].append((addr, name.strip()))
-
-    # Skip machine-only threads (no human sender) — keeps newsletters/alerts out
-    # of the graph and off the embedding bill. Side effect: every kept thread has
-    # a real sender, so the event label is never "Email: ? -> …".
-    if settings.gmail_skip_noise_senders and not any(
-        not _is_noise(addr) for addr, _ in by_role["from"]
-    ):
-        return None
-
-    participants: list[ThreadParticipant] = []
-    for role in ("from", "to", "cc"):
-        for addr, name in by_role[role]:
-            if _is_noise(addr):
-                continue
-            participants.append(ThreadParticipant(email=addr, name=name or None, role=role))
-
-    # Dates → occurred_at (latest), first/last for metadata.
-    dates = []
-    for m in parsed_msgs:
-        if m["occurred_at"]:
-            try:
-                dates.append(parsedate_to_datetime(m["occurred_at"]))
-            except (TypeError, ValueError):
-                pass
-    occurred_at = max(dates).isoformat() if dates else None
-    first_at = min(dates).isoformat() if dates else None
-
-    body = "\n\n---\n\n".join(sections)
-    _validate_content(body)
-
-    metadata = {
-        "event_type": "email",
-        "thread_root_id": root_id,
-        "gmail_thread_id": thread_id,
-        "mailbox": mailbox,
-        "message_count": len(parsed_msgs),
-        "first_at": first_at,
-        "last_at": occurred_at,
-        # All addresses incl. noise — public who-contacted-whom record.
-        "participants": {role: [a for a, _ in by_role[role]] for role in by_role},
-    }
-
-    return EmailThread(
-        tenant_id=tenant_id,
-        mailbox=mailbox,
-        gmail_thread_id=thread_id,
-        thread_hash=thread_hash,
-        participants=participants,
-        event_label=_event_label(by_role),
-        occurred_at=occurred_at,
-        metadata=metadata,
-        body=body,
-    )
+def _truncate_utf16(s: str, max_units: int) -> str:
+    """Truncate `s` to at most `max_units` UTF-16 code units without splitting a
+    surrogate pair (which would leave a lone surrogate that can't decode)."""
+    if _utf16_len(s) <= max_units:
+        return s
+    chunk = s.encode("utf-16-le")[: max_units * 2]
+    try:
+        return chunk.decode("utf-16-le")
+    except UnicodeDecodeError:
+        # Cut landed mid surrogate pair — drop the dangling half code unit.
+        return chunk[:-2].decode("utf-16-le")
 
 
 def _thread_root_id(parsed_msgs: list[dict[str, Any]]) -> str | None:
@@ -391,28 +355,128 @@ def _thread_root_id(parsed_msgs: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def _event_label(by_role: dict[str, list[tuple[str, str]]]) -> str:
-    """Subject-free label (subject is private), e.g. 'Email: Alice -> Bob'.
-    Built from real people only (noise senders/recipients are left out)."""
+def _addr_list(header: str | None) -> list[tuple[str, str | None]]:
+    """Parse an address header into (lowercased email, display name) pairs."""
+    out: list[tuple[str, str | None]] = []
+    for name, addr in getaddresses([header] if header else []):
+        a = addr.strip().lower()
+        if a:
+            out.append((a, name.strip() or None))
+    return out
 
-    def short(addr: str, name: str) -> str:
-        return name or addr.split("@")[0]
 
-    def people(role: str) -> list[str]:
-        return [short(a, n) for a, n in by_role[role] if not _is_noise(a)]
+def _iso_or_none(raw: str | None) -> str | None:
+    """RFC822 Date → tz-aware UTC ISO string (naive dates assumed UTC)."""
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
-    senders = people("from")
-    recipients = people("to")
-    sender_s = ", ".join(senders[:2]) or "?"
-    recip_s = ", ".join(recipients[:2]) or "?"
-    if len(recipients) > 2:
-        recip_s += f", +{len(recipients) - 2}"
-    return f"Email: {sender_s} -> {recip_s}"[:200]
+
+def _fallback_message_id(parsed: dict[str, Any]) -> str:
+    """Stable synthetic id for a message missing a Message-ID header."""
+    basis = f"{parsed.get('from', '')}|{parsed.get('occurred_at', '')}|{parsed.get('subject', '')}"
+    return "synthetic:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
+
+
+_BULK_PRECEDENCE = {"bulk", "list", "junk"}
+# Display-name words that mark a brand/team rather than a person.
+_BRAND_NAME_RE = re.compile(
+    r"\b(teams?|equipos?|[ée]quipes?|crew|newsletters?|notifications?|"
+    r"updates?|alerts?|support|no[-\s]?reply)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_brandy_name(name: str | None) -> bool:
+    """A sender display name that signals an org/team, not a person — e.g.
+    'El equipo de Miro', 'The X Team', or a single brandy token like 'Fun.xyz'.
+    Deliberately conservative: a normal personal name (with a space, or a single
+    token without a dotted-domain/digit) is kept."""
+    if not name:
+        return False
+    n = name.strip()
+    if _BRAND_NAME_RE.search(n):
+        return True
+    # Single token that looks like a domain/handle ("Fun.xyz") or carries digits.
+    return " " not in n and bool(re.search(r"\w\.\w{2,}", n) or re.search(r"\d", n))
+
+
+def _is_noise_message(parsed: dict[str, Any]) -> bool:
+    """True for non-human mail we don't ingest: newsletters / mailing lists,
+    marketing & product info, login/transactional, and other automated mail.
+
+    Detected from headers we already receive (List-Unsubscribe/List-Id,
+    Precedence: bulk|list|junk, Auto-Submitted), a no-reply/automated sender
+    address, or a brand/team sender display name (for marketing mail that carries
+    no machine headers). Meeting invitations (text/calendar) are intentionally
+    NOT filtered yet. A login/OTP mail from a custom domain with none of these
+    signals may still slip through."""
+    if parsed.get("list_mail"):
+        return True
+    if parsed.get("is_calendar"):
+        return True
+    if parsed.get("precedence") in _BULK_PRECEDENCE:
+        return True
+    auto = parsed.get("auto_submitted", "")
+    if auto and auto != "no":
+        return True
+    senders = _addr_list(parsed.get("from"))
+    if not senders:
+        return False
+    addr, name = senders[0]
+    return _is_noise(addr) or _is_brandy_name(name)
+
+
+def messages_from_thread(
+    parsed_msgs: list[dict[str, Any]],
+    *,
+    tenant_id: str,
+    mailbox: str,
+) -> list[EmailMessage]:
+    """Flatten a thread's parsed messages into per-message records.
+
+    Non-human messages (newsletters, automated/transactional, no-reply — see
+    `_is_noise_message`) are skipped entirely: no event, no entities. Pure: no
+    run context applied (direction/entities come later). `thread_id` is the
+    cross-mailbox-stable thread hash; messages with no References root fall back
+    to grouping by their own id.
+    """
+    root_id = _thread_root_id(parsed_msgs)
+    thread_id = hashlib.sha256(root_id.encode("utf-8")).hexdigest()[:32] if root_id else ""
+
+    out: list[EmailMessage] = []
+    for m in parsed_msgs:
+        if _is_noise_message(m):
+            continue
+        senders = _addr_list(m.get("from"))
+        sender = senders[0] if senders else ("", None)
+        mid = (m.get("message_id") or "").strip() or _fallback_message_id(m)
+        out.append(
+            EmailMessage(
+                tenant_id=tenant_id,
+                mailbox=mailbox,
+                message_id=mid,
+                thread_id=thread_id or hashlib.sha256(mid.encode("utf-8")).hexdigest()[:32],
+                occurred_at=_iso_or_none(m.get("occurred_at")),
+                sender=sender,
+                to=_addr_list(m.get("to")),
+                cc=_addr_list(m.get("cc")),
+                subject=m.get("subject") or "",
+                body=m.get("body") or "",
+            )
+        )
+    return out
 
 
 def _is_noise(addr: str) -> bool:
     local = addr.split("@", 1)[0]
-    return bool(_NOISE_LOCALPARTS.match(local))
+    return bool(_NOISE_LOCALPARTS.search(local))
 
 
 def _parse_message(msg_bytes: bytes) -> dict[str, Any]:
@@ -434,19 +498,21 @@ def _parse_message(msg_bytes: bytes) -> dict[str, Any]:
         "cc": str(msg.get("Cc", "")).strip(),
         "message_id": str(msg.get("Message-ID", "")).strip() or None,
         "references": references,
+        # Automated/bulk-mail signals (used to skip non-human messages).
+        "list_mail": bool(msg.get("List-Unsubscribe") or msg.get("List-Id")),
+        "precedence": str(msg.get("Precedence", "")).strip().lower(),
+        "auto_submitted": str(msg.get("Auto-Submitted", "")).strip().lower(),
+        "is_calendar": _has_calendar_part(msg),
     }
 
 
-def _clean_subject(subject: str | None) -> str:
-    if not subject:
-        return ""
-    s = subject.strip()
-    while True:
-        stripped = _RE_PREFIX.sub("", s)
-        if stripped == s:
-            break
-        s = stripped
-    return s[:120]
+def _has_calendar_part(msg: email.message.Message) -> bool:
+    """True if the message carries a calendar invite (text/calendar part, any
+    method — REQUEST/REPLY/CANCEL — or an Outlook calendar Content-Class)."""
+    for part in msg.walk():
+        if (part.get_content_type() or "").lower() == "text/calendar":
+            return True
+    return "calendarmessage" in str(msg.get("Content-Class", "")).lower()
 
 
 async def _get(

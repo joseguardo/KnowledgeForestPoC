@@ -1,3 +1,7 @@
+// DEPRECATED (2026-06): no longer called. The /gmail ingestion path was rebuilt
+// per-message and now uses insert-pointer + link-pointers (graph) and
+// ingest-document (private body). This thread-collapsed function is retained only
+// for history; safe to delete its deployment + this folder.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 

@@ -68,9 +68,19 @@ class MeetingNote:
     owner_name: str | None
     owner_email: str | None
     attendees: list[str]  # attendee emails (lowercased, deduped)
-    company: str | None
+    external_org: str | None  # raw free-text org the meeting is "about"; resolved downstream
     confidential: bool
     body: str  # joined content_fields; "" when none present
+
+
+@dataclass
+class NotesFetch:
+    """Result of a firm's fetch: the meetings plus the firm's own email domains
+    (derived from its team directory) so attendees at those domains classify as
+    colleagues — person-only, never a company."""
+
+    notes: list[MeetingNote]
+    own_domains: set[str]
 
 
 def load_notes_firms(tenant_id: str | None = None) -> list[NotesFirm]:
@@ -163,7 +173,7 @@ class NotesAdapter:
         since: str | None = None,
         max_results: int | None = None,
         connect: ConnectFn = _default_connect,
-    ) -> list[MeetingNote]:
+    ) -> NotesFetch:
         cap = max_results or settings.notes_max_results
         try:
             conn = await connect(firm.source_dsn)
@@ -183,7 +193,11 @@ class NotesAdapter:
                 if hasattr(result, "__await__"):
                     await result
 
-        return [_to_note(firm, dict(r), owner_map) for r in rows]
+        own_domains = {
+            em.split("@", 1)[1] for em in owner_map.values() if "@" in em
+        }
+        notes = [_to_note(firm, dict(r), owner_map) for r in rows]
+        return NotesFetch(notes=notes, own_domains=own_domains)
 
 
 async def _fetch_owner_email_map(conn: Any, firm: NotesFirm) -> dict[str, str]:
@@ -241,7 +255,7 @@ def _to_note(firm: NotesFirm, row: dict[str, Any], owner_map: dict[str, str]) ->
             seen.add(e)
             attendees.append(e)
 
-    company = (row.get("external_org") or "").strip() or None
+    external_org = (row.get("external_org") or "").strip() or None
     confidential = (row.get("confidential") or "").strip().lower() == "confidential"
 
     parts = [
@@ -262,7 +276,7 @@ def _to_note(firm: NotesFirm, row: dict[str, Any], owner_map: dict[str, str]) ->
         owner_name=owner_name,
         owner_email=owner_email,
         attendees=attendees,
-        company=company,
+        external_org=external_org,
         confidential=confidential,
         body=body,
     )

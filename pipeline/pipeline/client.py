@@ -124,40 +124,6 @@ class EdgeFunctionClient:
             payload["link"] = link
         return await self._call("ingest-document", payload)
 
-    async def ingest_email(
-        self,
-        *,
-        tenant_id: str,
-        participants: list[dict[str, Any]],
-        event: dict[str, Any],
-        access_class: str,
-        source: str | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "tenant_id": tenant_id,
-            "participants": participants,
-            "event": event,
-            "access_class": access_class,
-        }
-        if source:
-            payload["source"] = source
-        return await self._call("ingest-email", payload)
-
-    async def ingest_calendar(
-        self,
-        *,
-        owner: dict[str, Any],
-        events: list[dict[str, Any]],
-        access_class: str | None = None,
-        source: str | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"owner": owner, "events": events}
-        if access_class:
-            payload["access_class"] = access_class
-        if source:
-            payload["source"] = source
-        return await self._call("ingest-calendar", payload)
-
     async def link_pointers(
         self,
         *,

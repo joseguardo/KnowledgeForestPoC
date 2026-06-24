@@ -9,12 +9,13 @@ import pytest
 from pipeline.adapters import gmail as gmail_mod
 from pipeline.adapters.gmail import (
     GmailAdapter,
-    _clean_subject,
     _decode_sa_key,
-    _event_label,
     _is_noise,
+    _list_thread_ids,
     _parse_message,
     _thread_root_id,
+    _truncate_utf16,
+    _utf16_len,
     discover_mailboxes,
     load_firms,
 )
@@ -22,7 +23,8 @@ from pipeline.config import settings
 from pipeline.errors import ValidationError
 
 
-def _raw(sender, to, subject, date, body, msgid, references=None, cc=None) -> str:
+def _raw(sender, to, subject, date, body, msgid, references=None, cc=None,
+         extra_headers=None) -> str:
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = to
@@ -33,6 +35,8 @@ def _raw(sender, to, subject, date, body, msgid, references=None, cc=None) -> st
         msg["References"] = references
     if cc:
         msg["Cc"] = cc
+    for k, v in (extra_headers or {}).items():
+        msg[k] = v
     msg.set_content(body)
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
@@ -44,10 +48,24 @@ def _sa_b64() -> str:
 # ── pure helpers ────────────────────────────────────────────────────
 
 
-def test_clean_subject_strips_reply_prefixes():
-    assert _clean_subject("Re: Re: Deal terms") == "Deal terms"
-    assert _clean_subject("Fwd: Intro") == "Intro"
-    assert _clean_subject(None) == ""
+def test_utf16_len_counts_astral_as_two():
+    assert _utf16_len("abc") == 3
+    # An emoji is one Python code point but two UTF-16 code units.
+    assert _utf16_len("😀") == 2
+    assert _utf16_len("a😀b") == 4
+
+
+def test_truncate_utf16_respects_edge_budget():
+    # An all-emoji string: 10 code points = 20 UTF-16 units. Cap at 500000 is
+    # what the edge function (JS String.length) enforces.
+    body = "😀" * 400_000  # 800,000 UTF-16 units, well over the 500k edge cap
+    out = _truncate_utf16(body, 500_000)
+    assert _utf16_len(out) <= 500_000
+    # No dangling surrogate: it must round-trip cleanly (truncation cut between
+    # whole emoji, not through a surrogate pair).
+    out.encode("utf-16-le").decode("utf-16-le")
+    # BMP-only text truncates exactly to the code-unit budget.
+    assert _truncate_utf16("X" * 1000, 500) == "X" * 500
 
 
 def test_is_noise():
@@ -55,8 +73,11 @@ def test_is_noise():
     assert _is_noise("no-reply@x.com")
     assert _is_noise("mailer-daemon@x.com")
     assert _is_noise("notifications@github.com")
+    # 'noreply' anywhere in the local part (not just the start) counts.
+    assert _is_noise("comments-noreply@docs.google.com")
     assert not _is_noise("alice@x.com")
     assert not _is_noise("bob.smith@firm.com")
+    assert not _is_noise("autumn@x.com")  # 'auto' substring must not false-positive
 
 
 def test_parse_message_reads_threading_headers():
@@ -82,17 +103,6 @@ def test_thread_root_id_prefers_references_root():
 def test_thread_root_id_falls_back_to_own_id():
     msgs = [{"references": [], "message_id": "<only@x.com>"}]
     assert _thread_root_id(msgs) == "<only@x.com>"
-
-
-def test_event_label_excludes_noise_and_subject():
-    by_role = {
-        "from": [("alice@x.com", "Alice")],
-        "to": [("bob@y.com", "Bob"), ("noreply@stripe.com", "")],
-        "cc": [],
-    }
-    label = _event_label(by_role)
-    assert label == "Email: Alice -> Bob"
-    assert "noreply" not in label
 
 
 # ── firm config ─────────────────────────────────────────────────────
@@ -199,40 +209,6 @@ def test_load_firms_domain_without_admin_subject_rejected(monkeypatch):
         load_firms()
 
 
-# ── adapter: fetch_threads ──────────────────────────────────────────
-
-
-@pytest.fixture
-def _firm(monkeypatch):
-    monkeypatch.setattr(
-        settings, "gmail_firms",
-        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["me@acme.com"]}]),
-    )
-
-    async def fake_mint(sa_info, subject, scopes):
-        return f"tok-{subject}"
-
-    monkeypatch.setattr(gmail_mod, "_mint_token", fake_mint)
-    return load_firms()[0]
-
-
-def _thread_handler(messages: dict[str, str]):
-    ids = list(messages.keys())
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path.endswith("/threads"):
-            return httpx.Response(200, json={"threads": [{"id": "t1"}]})
-        if path.endswith("/threads/t1"):
-            return httpx.Response(200, json={"messages": [{"id": i} for i in ids]})
-        for mid, raw in messages.items():
-            if path.endswith(f"/messages/{mid}"):
-                return httpx.Response(200, json={"raw": raw})
-        return httpx.Response(404, json={})
-
-    return handler
-
-
 # ── adapter: discover_mailboxes (Directory API) ─────────────────────
 
 
@@ -301,155 +277,254 @@ async def test_discover_mailboxes_paginates(monkeypatch):
     assert result == ["a@acme.com", "b@acme.com"]
 
 
+
+def _threads_list_handler(pages: list[dict]):
+    """Serve threads.list pages in order, keyed by the request's pageToken.
+
+    Records the requested maxResults per call so the test can assert the
+    per-page size stays within Gmail's 500 limit.
+    """
+    by_token = {p.get("_token"): p for p in pages}
+    requested_max: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/threads"):
+            return httpx.Response(404, json={})
+        requested_max.append(int(request.url.params["maxResults"]))
+        token = request.url.params.get("pageToken")
+        page = by_token.get(token, {})
+        return httpx.Response(200, json={
+            "threads": [{"id": i} for i in page.get("ids", [])],
+            **({"nextPageToken": page["next"]} if page.get("next") else {}),
+        })
+
+    return handler, requested_max
+
+
 @pytest.mark.asyncio
-async def test_fetch_threads_splits_public_and_private(_firm):
-    r1 = _raw(
-        "Alice <alice@x.com>", "me@acme.com, noreply@stripe.com", "Q3 secret terms",
-        "Mon, 1 Jun 2026 10:00:00 +0000", "First.", "<root@x.com>",
-    )
-    r2 = _raw(
-        "me@acme.com", "Alice <alice@x.com>", "Re: Q3 secret terms",
-        "Mon, 1 Jun 2026 12:00:00 +0000", "Reply.", "<r2@acme.com>",
-        references="<root@x.com>", cc="cc@acme.com",
-    )
-    http = httpx.AsyncClient(transport=httpx.MockTransport(_thread_handler({"m1": r1, "m2": r2})))
-    threads = await GmailAdapter().fetch_threads(_firm, "me@acme.com", http, query="newer_than:7d")
+async def test_list_thread_ids_paginates_until_no_token():
+    handler, requested_max = _threads_list_handler([
+        {"_token": None, "ids": ["t1", "t2"], "next": "p2"},
+        {"_token": "p2", "ids": ["t3"]},
+    ])
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ids = await _list_thread_ids(http, {}, query="newer_than:7d", max_results=2000)
     await http.aclose()
-
-    assert len(threads) == 1
-    t = threads[0]
-    assert t.tenant_id == "T1"
-    # Stable cross-mailbox root from References chain.
-    assert t.metadata["thread_root_id"] == "<root@x.com>"
-    # Subject is private: absent from public label + metadata, present in body.
-    assert "secret" not in t.event_label.lower()
-    assert "secret" not in json.dumps(t.metadata).lower()
-    assert "secret" in t.body.lower()
-    # Real people become participants; noise is filtered out of entities…
-    emails = {p.email for p in t.participants}
-    assert {"alice@x.com", "me@acme.com", "cc@acme.com"} <= emails
-    assert "noreply@stripe.com" not in emails
-    # …but kept in the public who-contacted-whom metadata.
-    assert "noreply@stripe.com" in t.metadata["participants"]["to"]
-    # occurred_at = latest message.
-    assert "12:00:00" in t.occurred_at
+    # Both pages collected; per-page size never exceeds Gmail's 500 cap.
+    assert ids == ["t1", "t2", "t3"]
+    assert all(m <= 500 for m in requested_max)
 
 
 @pytest.mark.asyncio
-async def test_thread_hash_stable_across_mailboxes(_firm):
-    """Two mailboxes whose copies share a References root produce the same thread
-    hash (so the event + private class are shared), despite different Gmail IDs."""
-    a = _raw("X <x@x.com>", "a@acme.com", "Hi", "Mon, 1 Jun 2026 10:00:00 +0000",
-             "Body.", "<root@x.com>")
-    b_reply = _raw("a@acme.com", "X <x@x.com>", "Re: Hi", "Mon, 1 Jun 2026 11:00:00 +0000",
-                   "Re.", "<b-only@acme.com>", references="<root@x.com>")
-
-    http_a = httpx.AsyncClient(transport=httpx.MockTransport(_thread_handler({"m1": a})))
-    http_b = httpx.AsyncClient(transport=httpx.MockTransport(_thread_handler({"m9": b_reply})))
-    ta = await GmailAdapter().fetch_threads(_firm, "a@acme.com", http_a)
-    tb = await GmailAdapter().fetch_threads(_firm, "b@acme.com", http_b)
-    await http_a.aclose()
-    await http_b.aclose()
-
-    assert ta[0].thread_hash == tb[0].thread_hash
-
-
-@pytest.mark.asyncio
-async def test_fetch_threads_skips_noise_only_sender(_firm, monkeypatch):
-    """A thread whose only sender is a no-reply/alert address is dropped (no human
-    sender) — but kept when gmail_skip_noise_senders is off."""
-    raw = _raw(
-        "TTR Alerts <alerts@ttrdata.com>", "jose@kiboventures.com", "Market alert",
-        "Mon, 1 Jun 2026 10:00:00 +0000", "Newsletter body.", "<n1@ttrdata.com>",
-    )
-    monkeypatch.setattr(settings, "gmail_skip_noise_senders", True)
-    http = httpx.AsyncClient(transport=httpx.MockTransport(_thread_handler({"m1": raw})))
-    assert await GmailAdapter().fetch_threads(_firm, "jose@kiboventures.com", http) == []
+async def test_list_thread_ids_respects_total_cap():
+    """max_results caps the total across pages and stops paging once reached."""
+    handler, requested_max = _threads_list_handler([
+        {"_token": None, "ids": ["t1", "t2"], "next": "p2"},
+        {"_token": "p2", "ids": ["t3", "t4"]},
+    ])
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ids = await _list_thread_ids(http, {}, query=None, max_results=3)
     await http.aclose()
-
-    monkeypatch.setattr(settings, "gmail_skip_noise_senders", False)
-    http2 = httpx.AsyncClient(transport=httpx.MockTransport(_thread_handler({"m1": raw})))
-    kept = await GmailAdapter().fetch_threads(_firm, "jose@kiboventures.com", http2)
-    await http2.aclose()
-    assert len(kept) == 1
+    assert ids == ["t1", "t2", "t3"]
 
 
 @pytest.mark.asyncio
-async def test_fetch_threads_empty(_firm):
-    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
-    threads = await GmailAdapter().fetch_threads(_firm, "me@acme.com", http)
+async def test_list_thread_ids_page_guard(monkeypatch):
+    """gmail_max_pages bounds the loop even when pages keep offering a token."""
+    monkeypatch.setattr(settings, "gmail_max_pages", 2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"threads": [{"id": "t"}], "nextPageToken": "more"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ids = await _list_thread_ids(http, {}, query=None, max_results=10_000)
     await http.aclose()
-    assert threads == []
+    assert len(ids) == 2  # two pages, then the guard stops it
 
 
 # ── endpoint orchestration: firm isolation + grant tiers ────────────
 
 
+
 @pytest.mark.asyncio
-async def test_ingest_gmail_endpoint_splits_tiers_and_namespaces(async_client, monkeypatch):
-    """POST /gmail wires the firm-wide graph (firm:<tenant>, tenant-granted) and the
-    private body (gmailthread:<tenant>:<hash>, user-granted) with tenant-namespaced
-    canonical keys."""
-    from pipeline.adapters.gmail import EmailThread, ThreadParticipant
+async def test_ingest_gmail_messages_builds_per_message_entities(async_client, monkeypatch):
+    """POST /gmail/messages (step-1 path): one event per message; humans → person,
+    role mailboxes/CRM domains → company; edges sent/to/affiliated_with; everything
+    under the firm class. Uses the real extract_graph; only I/O is mocked."""
+    from pipeline.adapters.gmail import EmailMessage
     from pipeline.api import ingest as ingest_mod
     from pipeline.main import app
 
     monkeypatch.setattr(
         settings, "gmail_firms",
-        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["me@acme.com"]}]),
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["me@kiboventures.com"]}]),
     )
 
-    thread = EmailThread(
-        tenant_id="T1", mailbox="me@acme.com", gmail_thread_id="t1", thread_hash="HASH",
-        participants=[
-            ThreadParticipant("alice@x.com", "Alice", "from"),
-            ThreadParticipant("me@acme.com", None, "to"),
-        ],
-        event_label="Email: Alice -> me", occurred_at="2026-06-01T12:00:00+00:00",
-        metadata={"event_type": "email", "thread_root_id": "<root@x.com>"},
-        body="Subject: secret\n\nBody.",
-    )
+    msgs = [
+        EmailMessage(
+            tenant_id="T1", mailbox="me@kiboventures.com", message_id="<a@x>", thread_id="TH",
+            occurred_at="2026-06-01T10:00:00+00:00", sender=("me@kiboventures.com", "Me"),
+            to=[("ana@gohub.vc", "Ana")], cc=[("info@gohub.vc", "GoHub Info")],
+            subject="Q3 secret terms", body="Body.",
+        ),
+    ]
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
-        return [thread]
+        return msgs
 
-    monkeypatch.setattr(GmailAdapter, "fetch_threads", fake_fetch)
-    monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={"me@acme.com": "user-uuid"}))
-    ensure_class = AsyncMock(return_value="class-id")
-    tenant_grant = AsyncMock()
-    user_grant = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "ensure_class", ensure_class)
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", tenant_grant)
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", user_grant)
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    # CRM knows gohub.vc with a real name.
+    monkeypatch.setattr(
+        ingest_mod, "_load_company_domains",
+        AsyncMock(return_value={"gohub.vc": "GoHub Ventures"}),
+    )
+    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
+    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
+    # Only the internal colleague resolves to a platform user.
+    monkeypatch.setattr(
+        ingest_mod, "resolve_user_ids",
+        AsyncMock(return_value={"me@kiboventures.com": "uid-me"}),
+    )
+    add_members = AsyncMock()
+    monkeypatch.setattr(ingest_mod, "add_thread_members", add_members)
+
+    # pointer_id == canonical_key, so edge source/target are the keys themselves.
+    async def fake_insert(**kw):
+        return {"status": "created", "pointer_id": kw["canonical_key"]}
 
     client = AsyncMock()
-    client.ingest_email.return_value = {"status": "created", "pointer_id": "event-1"}
-    client.ingest_document.return_value = {"status": "created", "pointer_id": "doc-1"}
+    client.insert_pointer = AsyncMock(side_effect=fake_insert)
+    client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
     app.state.client = client
 
     resp = await async_client.post("/api/v1/ingest/gmail", json={})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["items_produced"] == 1
 
-    # firm-wide class ensured + tenant-granted; private class ensured + user-granted.
-    ensured_keys = {c.args[1] for c in ensure_class.call_args_list}
-    assert "firm:T1" in ensured_keys
-    assert "gmailthread:T1:HASH" in ensured_keys
-    tenant_grant.assert_awaited()
-    user_grant.assert_awaited()
+    inserted = {(c.kwargs["type"], c.kwargs["canonical_key"]): c.kwargs
+                for c in client.insert_pointer.call_args_list}
+    keys = {ck for _t, ck in inserted}
+    # role mailbox info@ → company, not a person; CRM name used; ana is a person.
+    assert ("company", "company::T1::gohub.vc") in inserted
+    assert inserted[("company", "company::T1::gohub.vc")]["label"] == "GoHub Ventures"
+    assert ("person", "person::T1::ana@gohub.vc") in inserted
+    assert ("person", "person::T1::me@kiboventures.com") in inserted
+    assert "person::T1::info@gohub.vc" not in keys
+    # exactly one event, subject-free, under the firm class.
+    events = [ck for t, ck in inserted if t == "message"]
+    assert len(events) == 1
+    assert "secret" not in inserted[("message", events[0])]["label"].lower()
+    assert all(c.kwargs["access_class"] == "firm:T1" for c in client.insert_pointer.call_args_list)
 
-    # Public communication graph under the firm class, tenant-namespaced keys.
-    ekw = client.ingest_email.call_args.kwargs
-    assert ekw["access_class"] == "firm:T1"
-    assert ekw["event"]["canonical_key"] == "event:T1:gmailthread:HASH"
-    assert all(p["canonical_key"].startswith("person::T1::") for p in ekw["participants"])
+    links = {(c.kwargs["source_id"], c.kwargs["relationship_type"], c.kwargs["target_id"])
+             for c in client.link_pointers.call_args_list}
+    assert ("person::T1::ana@gohub.vc", "affiliated_with", "company::T1::gohub.vc") in links
+    assert ("person::T1::me@kiboventures.com", "sent", events[0]) in links
+    assert (events[0], "received", "person::T1::ana@gohub.vc") in links
+    # no to/cc/about edges — recipients are `received`, `about` is deferred
+    assert not any(rel in ("to", "cc", "about") for _s, rel, _t in links)
 
-    # Private body under the per-thread class, namespaced, linked to the event.
+    # Private body: one document under the sentinel email_body class, linked to
+    # the message, tenant-namespaced; only the internal participant is a member.
     dkw = client.ingest_document.call_args.kwargs
-    assert dkw["access_class"] == "gmailthread:T1:HASH"
+    assert dkw["access_class"] == "email_body"
     assert dkw["canonical_key_namespace"] == "T1"
-    assert dkw["link"]["target_id"] == "event-1"
-    assert "secret" in dkw["content"]
+    assert dkw["link"]["target_id"] == events[0]
+    assert dkw["link"]["relationship_type"] == "email_content"
+    assert "Body." in dkw["content"]
+    assert dkw["metadata"]["thread_id"] == "TH"
+    mkw = add_members.call_args
+    assert mkw.args[1] == "T1" and mkw.args[2] == "TH"
+    assert set(mkw.args[3]) == {"uid-me"}  # external ana/info not platform users
+
+
+@pytest.mark.asyncio
+async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client, monkeypatch):
+    """A message that already exists (insert returns `merged`) does not re-ingest
+    its body — avoids re-embedding the second-mailbox copy / since_last overlap."""
+    from pipeline.adapters.gmail import EmailMessage
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.main import app
+
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["me@kiboventures.com"]}]),
+    )
+    msgs = [EmailMessage(
+        tenant_id="T1", mailbox="me@kiboventures.com", message_id="<a@x>", thread_id="TH",
+        occurred_at="2026-06-01T10:00:00+00:00", sender=("me@kiboventures.com", "Me"),
+        to=[("jose@kiboventures.com", "Jose")], cc=[], subject="Hi", body="Body.",
+    )]
+
+    async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
+        return msgs
+
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
+    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
+    add_members = AsyncMock()
+    monkeypatch.setattr(ingest_mod, "add_thread_members", add_members)
+
+    async def fake_insert(**kw):
+        # the message node already exists → merged; entities otherwise created
+        status = "merged" if kw["type"] == "message" else "created"
+        return {"status": status, "pointer_id": kw["canonical_key"]}
+
+    client = AsyncMock()
+    client.insert_pointer = AsyncMock(side_effect=fake_insert)
+    client.ingest_document = AsyncMock()
+    app.state.client = client
+
+    resp = await async_client.post("/api/v1/ingest/gmail", json={})
+    assert resp.status_code == 200, resp.text
+    client.ingest_document.assert_not_called()
+    add_members.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ingest_gmail_messages_scopes_to_subject(async_client, monkeypatch):
+    """`subject` restricts the step-1 run to that one mailbox, skipping discovery."""
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.main import app
+
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(),
+                     "mailboxes": ["me@acme.com", "other@acme.com"]}]),
+    )
+
+    fetched: list[str] = []
+
+    async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
+        fetched.append(subject)
+        return []
+
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
+    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
+    app.state.client = AsyncMock()
+
+    resp = await async_client.post(
+        "/api/v1/ingest/gmail", json={"subject": "me@acme.com"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert fetched == ["me@acme.com"]  # only the requested mailbox
+
+    # With an explicit tenant_id, a subject outside the static list is still
+    # honored (the firm's SA has domain-wide delegation).
+    fetched.clear()
+    resp = await async_client.post(
+        "/api/v1/ingest/gmail",
+        json={"tenant_id": "T1", "subject": "niklas@acme.com"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert fetched == ["niklas@acme.com"]
 
 
 @pytest.mark.asyncio
@@ -471,11 +546,12 @@ async def test_ingest_gmail_manual_pull_defaults_lookback(async_client, monkeypa
         captured["query"] = query
         return []
 
-    monkeypatch.setattr(GmailAdapter, "fetch_threads", fake_fetch)
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
     monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
     monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
     app.state.client = AsyncMock()
 
     # No query → defaults to the lookback window.
@@ -523,11 +599,12 @@ async def test_ingest_gmail_domain_discovery_carves_out_explicit(async_client, m
         fetched.append((firm.tenant_id, subject))
         return []
 
-    monkeypatch.setattr(GmailAdapter, "fetch_threads", fake_fetch)
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
     monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
     monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
     app.state.client = AsyncMock()
 
     resp = await async_client.post("/api/v1/ingest/gmail", json={})

@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # when a request omits an explicit subject.
     gmail_delegated_subjects: str | None = None
     gmail_max_results: int = 25
+    # Safety guard on threads.list pagination: a large `max_results` (e.g. a
+    # full-history backfill) walks `nextPageToken` until the cap or pages are
+    # exhausted; this bounds the page count so a runaway query can't loop forever
+    # (50 pages × 500/page ≈ 25k threads).
+    gmail_max_pages: int = 50
     gmail_scopes: str = "https://www.googleapis.com/auth/gmail.readonly"
     # Optional mailbox auto-discovery: when a firm entry declares a `domain`
     # instead of an explicit `mailboxes` list, the connector enumerates that
@@ -69,6 +74,22 @@ class Settings(BaseSettings):
     gmail_firms: str | None = None
     # First-run backfill window (days) for recurrent per-mailbox sync.
     gmail_backfill_days: int = 7
+    # Step-1 entity extraction. Free-mail providers never become company nodes
+    # (a person at gmail.com has no company); role mailboxes (info@, sales@, …)
+    # represent their company rather than a fictitious person. Comma-separated;
+    # matched case-insensitively. Noise senders (no-reply@, mailer-daemon, …) are
+    # handled separately by the existing noise filter and are skipped entirely.
+    gmail_free_mail_domains: str = (
+        "gmail.com,googlemail.com,outlook.com,hotmail.com,live.com,msn.com,"
+        "yahoo.com,yahoo.co.uk,ymail.com,icloud.com,me.com,mac.com,aol.com,"
+        "proton.me,protonmail.com,gmx.com,gmx.net,mail.com,zoho.com,yandex.com,"
+        "fastmail.com,hey.com,pm.me,qq.com,163.com"
+    )
+    gmail_role_localparts: str = (
+        "info,hello,contact,team,sales,support,help,admin,office,press,jobs,"
+        "careers,hr,billing,accounts,marketing,newsletter,news,events,booking,"
+        "bookings,registration,invite,invites,deals,partnerships,partners,welcome"
+    )
     # Drop threads whose only sender is a no-reply/alert address (keeps automated
     # newsletters out of the graph and off the embedding bill). Set False to
     # ingest everything regardless of sender.

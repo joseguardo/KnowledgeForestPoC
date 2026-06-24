@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
 import pytest
 
 from pipeline.adapters.notes import (
-    MeetingNote,
     NotesAdapter,
+    NotesFetch,
     NotesFirm,
     _clean_title,
     _to_note,
     load_notes_firms,
     slugify,
 )
-from pipeline.api import ingest as ingest_mod
-from pipeline.client import EdgeFunctionClient
 from pipeline.config import settings
 from pipeline.errors import ValidationError
 
@@ -73,7 +70,8 @@ def test_to_note_resolves_owner_email_and_dedups_attendees():
     assert note.attendees == ["gpa@kiboventures.com", "x@y.com"]
     # owner email is among the attendees → same person, keyed once downstream
     assert note.owner_email in note.attendees
-    assert note.company == "Poseidon"
+    # external_org kept raw — resolution against the CRM happens downstream
+    assert note.external_org == "Poseidon"
     assert note.confidential is False
     assert note.occurred_at == "2026-06-19T09:00:00+00:00"
     assert note.last_edited == "2026-06-19T10:41:00+00:00"
@@ -84,7 +82,7 @@ def test_to_note_confidential_and_empty_body():
     note = _to_note(_firm(), _row(confidential="Confidential", notion_summary=None), {})
     assert note.confidential is True
     assert note.body == ""
-    assert note.owner_email is None  # unresolved → endpoint uses name-slug fallback
+    assert note.owner_email is None  # unresolved → owner dropped downstream
 
 
 # ── config parsing ──────────────────────────────────────────────────
@@ -145,112 +143,25 @@ class _FakeConn:
 
 
 @pytest.mark.asyncio
-async def test_fetch_notes_maps_rows_and_resolves_owner():
+async def test_fetch_notes_maps_rows_resolves_owner_and_exposes_own_domains():
     conn = _FakeConn(
         meetings=[_row()],
-        team_rows=[{"nm": "Guillermo Puebla", "em": "gpa@kiboventures.com"}],
+        team_rows=[
+            {"nm": "Guillermo Puebla", "em": "gpa@kiboventures.com"},
+            {"nm": "Nadia Z", "em": "nadia@nzalpha.com"},
+        ],
     )
 
     async def fake_connect(dsn):
         assert dsn == DSN
         return conn
 
-    notes = await NotesAdapter().fetch_notes(_firm(), connect=fake_connect)
+    fetched = await NotesAdapter().fetch_notes(_firm(), connect=fake_connect)
     assert conn.closed is True
-    assert len(notes) == 1
-    assert notes[0].owner_email == "gpa@kiboventures.com"
-    assert notes[0].title == "Ext. Call Poseidon"
-
-
-# ── orchestration: access-class routing for the body ────────────────
-
-
-def _patch_access(monkeypatch):
-    ensure_class = AsyncMock(return_value="class-id-123")
-    ensure_user_grant = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "ensure_class", ensure_class)
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", ensure_user_grant)
-    return ensure_class, ensure_user_grant
-
-
-def _client() -> EdgeFunctionClient:
-    c = AsyncMock(spec=EdgeFunctionClient)
-    c.ingest_calendar.return_value = {"results": [{"status": "created", "pointer_id": "evt-1"}]}
-    c.ingest_document.return_value = {"status": "created", "pointer_id": "doc-1"}
-    return c
-
-
-def _note(**kw) -> MeetingNote:
-    base = dict(
-        tenant_id=TENANT,
-        page_id="pg-1",
-        title="Board sync",
-        occurred_at="2026-06-19T09:00:00+00:00",
-        last_edited="2026-06-19T10:41:00+00:00",
-        owner_name="Guillermo Puebla",
-        owner_email="gpa@kiboventures.com",
-        attendees=["gpa@kiboventures.com", "lp@external.com"],
-        company="Poseidon",
-        confidential=False,
-        body="### Notes\nAll good.",
-    )
-    base.update(kw)
-    return MeetingNote(**base)
-
-
-@pytest.mark.asyncio
-async def test_ingest_meeting_shareable_body_is_firm_wide(monkeypatch):
-    ensure_class, ensure_user_grant = _patch_access(monkeypatch)
-    client = _client()
-
-    resp = await ingest_mod._ingest_meeting(
-        AsyncMock(), client, _note(confidential=False), f"firm:{TENANT}", {}
-    )
-
-    # graph uses the firm class + tenant-namespaced canonical keys
-    cal_kwargs = client.ingest_calendar.call_args.kwargs
-    assert cal_kwargs["access_class"] == f"firm:{TENANT}"
-    assert cal_kwargs["owner"]["canonical_key"] == f"person::{TENANT}::gpa@kiboventures.com"
-    assert cal_kwargs["events"][0]["canonical_key"] == f"event:{TENANT}:meetingnote:pg-1"
-    # owner shares the attendee key (no duplicate person node)
-    att_keys = {a["canonical_key"] for a in cal_kwargs["events"][0]["attendees"]}
-    assert cal_kwargs["owner"]["canonical_key"] in att_keys
-
-    # shareable body → firm-wide class, no private class ensured, linked to event
-    doc_kwargs = client.ingest_document.call_args.kwargs
-    assert doc_kwargs["access_class"] == f"firm:{TENANT}"
-    assert doc_kwargs["link"]["target_id"] == "evt-1"
-    assert doc_kwargs["link"]["relationship_type"] == "meeting_notes"
-    ensure_class.assert_not_called()
-    ensure_user_grant.assert_not_called()
-    assert resp["event_id"] == "evt-1"
-
-
-@pytest.mark.asyncio
-async def test_ingest_meeting_confidential_body_is_private_with_grants(monkeypatch):
-    ensure_class, ensure_user_grant = _patch_access(monkeypatch)
-    client = _client()
-    user_ids = {"gpa@kiboventures.com": "uid-owner", "lp@external.com": "uid-lp"}
-
-    await ingest_mod._ingest_meeting(
-        AsyncMock(), client, _note(confidential=True), f"firm:{TENANT}", user_ids
-    )
-
-    # private class ensured BEFORE ingest, body tagged with it
-    ensure_class.assert_awaited_once()
-    assert ensure_class.call_args.args[1] == f"meetingnote:{TENANT}:pg-1"
-    doc_kwargs = client.ingest_document.call_args.kwargs
-    assert doc_kwargs["access_class"] == f"meetingnote:{TENANT}:pg-1"
-    # owner + attendees with accounts are granted
-    assert ensure_user_grant.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_ingest_meeting_no_body_skips_document(monkeypatch):
-    _patch_access(monkeypatch)
-    client = _client()
-    await ingest_mod._ingest_meeting(
-        AsyncMock(), client, _note(body=""), f"firm:{TENANT}", {}
-    )
-    client.ingest_calendar.assert_awaited_once()
-    client.ingest_document.assert_not_called()
+    assert isinstance(fetched, NotesFetch)
+    assert len(fetched.notes) == 1
+    assert fetched.notes[0].owner_email == "gpa@kiboventures.com"
+    assert fetched.notes[0].title == "Ext. Call Poseidon"
+    # own_domains derived from the firm's team-table emails (treats colleagues as
+    # person-only downstream, never as companies).
+    assert fetched.own_domains == {"kiboventures.com", "nzalpha.com"}
