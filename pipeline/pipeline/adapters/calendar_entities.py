@@ -12,7 +12,11 @@ Per event it emits:
   - `person -attended-> event` for the calendar owner AND every other human
     participant — one symmetric relationship, no owner/attendee distinction;
   - `person -affiliated_with-> company` for participants at a qualifying domain;
-  - `event -regarding-> company` for those companies.
+  - `event -regarding-> company` for those companies;
+  - for a recurring meeting: each occurrence carries `is_recurring`/`series_id` in
+    its metadata and links `event -instance_of-> <series node>` (a parent node
+    keyed by Google's recurringEventId, shared by all occurrences). One-off events
+    have `is_recurring=False` and no series node.
 
 People are keyed by email so calendar attendance reconciles onto existing person/
 company nodes. Calendars have no outbound correspondence signal, so a domain
@@ -30,6 +34,7 @@ from pipeline.adapters.email_entities import (
     _looks_like_email,
     classify_address,
 )
+from pipeline.adapters.notes_entities import name_from_email
 
 if TYPE_CHECKING:
     from pipeline.adapters.calendar import CalendarEvent
@@ -40,16 +45,24 @@ def event_key(tenant: str, ical_uid: str) -> str:
     return f"event:{tenant}:gcal:{ical_uid}"
 
 
+def series_key(tenant: str, recurring_event_id: str) -> str:
+    """Canonical key for a recurring-meeting *series* node, keyed by Google's
+    recurringEventId so every occurrence groups under one series."""
+    return f"event:{tenant}:gcal-series:{recurring_event_id}"
+
+
 def extract_graph(
     events: list[CalendarEvent],
     *,
     crm_domains: set[str],
     crm_names: dict[str, str],
     own_domains: set[str],
+    name_by_email: dict[str, str] | None = None,
     free_mail_domains: set[str] | None = None,
     role_localparts: set[str] | None = None,
 ) -> Extraction:
     """Deterministic core of calendar ingestion (see module docstring)."""
+    names = name_by_email or {}
     entities: dict[str, Entity] = {}
     edges: list[Edge] = []
     seen_edges: set[tuple[str, str, str]] = set()
@@ -73,8 +86,12 @@ def extract_graph(
     def classify_participant(tenant: str, addr: str, name: str | None) -> tuple[str | None, str | None]:
         """Register the entities an address implies (+ the person's
         `affiliated_with` edge) and return (person_ck, company_ck)."""
+        # Google usually omits attendee display names, so resolve like Notes does:
+        # the provided name, else the graph's person directory, else a confident
+        # email-local-part guess, else None (label falls back to the address).
+        resolved = name or names.get((addr or "").strip().lower()) or name_from_email(addr)
         c = classify_address(
-            addr, name, crm_domains=crm_domains, correspondent_domains=set(),
+            addr, resolved, crm_domains=crm_domains, correspondent_domains=set(),
             own_domains=own_domains, crm_names=crm_names,
             free_mail_domains=free_mail_domains, role_localparts=role_localparts,
         )
@@ -102,8 +119,25 @@ def extract_graph(
                 "organizer_email": ev.organizer[0] or None,
                 "provider": "google-calendar",
                 "calendar_email": ev.calendar_email,
+                "is_recurring": bool(ev.recurring_event_id),
+                "series_id": ev.recurring_event_id,
             },
         ))
+
+        # Recurring occurrence → group it under a shared series node. Each
+        # occurrence stays its own event (distinct iCalUID); the series is a
+        # parent the whole recurring meeting hangs off (no attendance of its own).
+        if ev.recurring_event_id:
+            series_ck = series_key(tenant, ev.recurring_event_id)
+            add_entity(Entity(
+                series_ck, "event", ev.title,
+                metadata={
+                    "event_type": "meeting_series",
+                    "provider": "google-calendar",
+                    "series_id": ev.recurring_event_id,
+                },
+            ))
+            add_edge(event_ck, "instance_of", series_ck, why="occurrence of this recurring meeting")
 
         # Owner and every other participant relate to the event the same way:
         # `person -attended-> event` (symmetric — no owner/attendee distinction).

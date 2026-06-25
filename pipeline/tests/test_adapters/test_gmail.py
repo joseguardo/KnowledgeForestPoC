@@ -378,16 +378,12 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
         ingest_mod, "_load_company_domains",
         AsyncMock(return_value={"gohub.vc": "GoHub Ventures"}),
     )
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
     # Only the internal colleague resolves to a platform user.
     monkeypatch.setattr(
         ingest_mod, "resolve_user_ids",
         AsyncMock(return_value={"me@kiboventures.com": "uid-me"}),
     )
     add_members = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "add_thread_members", add_members)
 
     # pointer_id == canonical_key, so edge source/target are the keys themselves.
     async def fake_insert(**kw):
@@ -459,12 +455,8 @@ async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", AsyncMock())
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
     add_members = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "add_thread_members", add_members)
 
     async def fake_insert(**kw):
         # the message node already exists → merged; entities otherwise created
@@ -502,10 +494,7 @@ async def test_ingest_gmail_messages_scopes_to_subject(async_client, monkeypatch
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
-    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
     app.state.client = AsyncMock()
 
     resp = await async_client.post(
@@ -547,9 +536,6 @@ async def test_ingest_gmail_manual_pull_defaults_lookback(async_client, monkeypa
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
-    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
     app.state.client = AsyncMock()
 
     # No query → defaults to the lookback window.
@@ -600,9 +586,6 @@ async def test_ingest_gmail_domain_discovery_carves_out_explicit(async_client, m
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value={}))
-    monkeypatch.setattr(ingest_mod, "add_thread_members", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
     app.state.client = AsyncMock()
 
     resp = await async_client.post("/api/v1/ingest/gmail", json={})

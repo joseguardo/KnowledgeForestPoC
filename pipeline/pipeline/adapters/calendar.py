@@ -26,13 +26,34 @@ from typing import Any
 
 import httpx
 
-# Reuse the Gmail connector's Google auth + HTTP plumbing (same SA / DWD client).
-from pipeline.adapters.gmail import GmailFirm, _get, _mint_token
+# Reuse the Gmail connector's Google auth + HTTP plumbing + SA-key decoding.
+from pipeline.adapters.gmail import (
+    GmailFirm,
+    _decode_sa_key,
+    _get,
+    _load_sa_info_json,
+    _mint_token,
+)
 from pipeline.config import settings
 
 log = logging.getLogger(__name__)
 
 CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
+
+
+def _calendar_sa_info() -> dict[str, Any] | None:
+    """The calendar connector's own service account, or None to reuse Gmail's.
+
+    Calendar runs on a separate SA whose client id is the one authorized for
+    `calendar.readonly` domain-wide delegation. Base64 takes precedence over the
+    raw-JSON/path form, mirroring the Gmail key resolution."""
+    b64 = (settings.calendar_sa_key_b64 or "").strip()
+    if b64:
+        return _decode_sa_key(b64)
+    raw = (settings.calendar_sa_key_json or "").strip()
+    if raw:
+        return _load_sa_info_json(raw)
+    return None
 
 
 @dataclass
@@ -57,6 +78,9 @@ class CalendarEvent:
     description: str
     organizer: tuple[str, str | None]         # (email, display name)
     attendees: list[tuple[str, str | None]]   # other humans: (email, display name)
+    # `recurringEventId` — the series id when this is an instance of a recurring
+    # meeting; None for a one-off. (Distinct from iCalUID, which is per-occurrence.)
+    recurring_event_id: str | None = None
 
 
 def _attendee_name(att: dict[str, Any]) -> str | None:
@@ -137,6 +161,7 @@ def events_from_calendar(
                 description=(it.get("description") or "").strip(),
                 organizer=(org_email, org_name),
                 attendees=list(others.items()),
+                recurring_event_id=(it.get("recurringEventId") or "").strip() or None,
             )
         )
     return out
@@ -149,16 +174,18 @@ async def fetch_events(
     *,
     updated_min: str | None = None,
     max_results: int | None = None,
+    sa_info: dict[str, Any] | None = None,
 ) -> list[CalendarEvent]:
     """Fetch `subject`'s primary calendar and flatten to records.
 
-    Mints a DWD token for the Calendar scope, pages `events.list` (recurring
-    events expanded to instances, ordered by start) over a `timeMin = now -
+    Mints a DWD token for the Calendar scope using `sa_info` (the calendar SA)
+    when given, else the firm's Gmail SA. Pages `events.list` (recurring events
+    expanded to instances, ordered by start) over a `timeMin = now -
     calendar_backfill_days` window with no upper bound (upcoming events included),
     and — when `updated_min` is given (incremental sync) — only events changed
     since then. Bounded by `calendar_max_pages` / `max_results`.
     """
-    token = await _mint_token(firm.sa_info, subject, settings.calendar_scopes)
+    token = await _mint_token(sa_info or firm.sa_info, subject, settings.calendar_scopes)
     headers = {"Authorization": f"Bearer {token}"}
     cap = max_results or settings.calendar_max_results
     time_min = (

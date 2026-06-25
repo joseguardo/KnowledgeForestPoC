@@ -37,6 +37,7 @@ def _event(**kw):
         description="Agenda for the call.",
         organizer=(OWNER, "Guillermo Puebla"),
         attendees=[("lp@poseidon.vc", "Laura Páez")],
+        recurring_event_id=None,
     )
     base.update(kw)
     return CalendarEvent(**base)
@@ -56,8 +57,8 @@ def _wire(monkeypatch, *, events, get_cursor=None, set_cursor=None):
         }]),
     )
 
-    async def fake_fetch(firm, subject, http, *, updated_min=None, max_results=None):
-        fake_fetch.calls.append({"subject": subject, "updated_min": updated_min})
+    async def fake_fetch(firm, subject, http, *, updated_min=None, max_results=None, sa_info=None):
+        fake_fetch.calls.append({"subject": subject, "updated_min": updated_min, "sa_info": sa_info})
         return events
     fake_fetch.calls = []
 
@@ -65,8 +66,7 @@ def _wire(monkeypatch, *, events, get_cursor=None, set_cursor=None):
     monkeypatch.setattr(
         ingest_mod, "_load_company_domains", AsyncMock(return_value={"poseidon.vc": "Poseidon"})
     )
-    monkeypatch.setattr(ingest_mod, "ensure_class", AsyncMock(return_value="class-id"))
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
+    monkeypatch.setattr(ingest_mod, "_load_person_names", AsyncMock(return_value={}))
     monkeypatch.setattr(ingest_mod, "get_cursor", AsyncMock(return_value=get_cursor))
     set_cursor_mock = set_cursor or AsyncMock()
     monkeypatch.setattr(ingest_mod, "set_cursor", set_cursor_mock)
@@ -117,6 +117,30 @@ async def test_ingest_calendar_builds_event_graph(async_client, monkeypatch):
     assert dkw["link"]["target_id"] == ev_ck
     assert dkw["link"]["relationship_type"] == "event_details"
     assert dkw["canonical_key_namespace"] == TENANT
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_uses_dedicated_calendar_sa(async_client, monkeypatch):
+    """When CALENDAR_SA_KEY_* is set, the fetch mints with that SA, not Gmail's."""
+    cal_sa_b64 = base64.b64encode(b'{"client_email": "calendar-sa@x.iam"}').decode()
+    monkeypatch.setattr(settings, "calendar_sa_key_b64", cal_sa_b64, raising=False)
+    monkeypatch.setattr(settings, "calendar_sa_key_json", None, raising=False)
+    _client, fake_fetch, _ = _wire(monkeypatch, events=[_event()])
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+    assert fake_fetch.calls[0]["sa_info"] == {"client_email": "calendar-sa@x.iam"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_falls_back_to_gmail_sa(async_client, monkeypatch):
+    monkeypatch.setattr(settings, "calendar_sa_key_b64", None, raising=False)
+    monkeypatch.setattr(settings, "calendar_sa_key_json", None, raising=False)
+    _client, fake_fetch, _ = _wire(monkeypatch, events=[_event()])
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+    assert fake_fetch.calls[0]["sa_info"] is None  # endpoint passes None → fetch uses firm SA
 
 
 @pytest.mark.asyncio

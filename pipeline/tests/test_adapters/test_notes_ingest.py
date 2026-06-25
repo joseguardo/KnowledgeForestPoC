@@ -89,11 +89,6 @@ def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None):
     monkeypatch.setattr(
         ingest_mod, "_load_person_names", AsyncMock(return_value=person_names or {})
     )
-    ensure_class = AsyncMock(return_value="class-id")
-    ensure_user_grant = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "ensure_class", ensure_class)
-    monkeypatch.setattr(ingest_mod, "ensure_tenant_grant", AsyncMock())
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", ensure_user_grant)
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value=user_ids))
 
     async def fake_insert(**kw):
@@ -103,7 +98,7 @@ def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None):
     client.insert_pointer = AsyncMock(side_effect=fake_insert)
     client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
     app.state.client = client
-    return client, ensure_class, ensure_user_grant
+    return client, None, None
 
 
 @pytest.mark.asyncio

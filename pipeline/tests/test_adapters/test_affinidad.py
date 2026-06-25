@@ -279,11 +279,9 @@ def _aclient() -> EdgeFunctionClient:
 
 
 def _patch_access(monkeypatch):
-    ensure_class = AsyncMock(return_value="class-id-1")
-    ensure_user_grant = AsyncMock()
-    monkeypatch.setattr(ingest_mod, "ensure_class", ensure_class)
-    monkeypatch.setattr(ingest_mod, "ensure_user_grant", ensure_user_grant)
-    return ensure_class, ensure_user_grant
+    # Legacy ensure_class/ensure_user_grant are gone (visibility is acl now);
+    # return fresh dummies so existing unpacking + assert_not_called() still hold.
+    return AsyncMock(), AsyncMock()
 
 
 @pytest.mark.asyncio

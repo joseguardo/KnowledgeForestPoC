@@ -87,18 +87,32 @@ mechanism that does not exist yet (deferred).
 - `thread_membership` + `can_read_thread*` (email-body gate) → participant uids in
   the body's `acl`. (Caveat: uids are frozen at ingest; a participant who signs up
   later is re-added only on re-ingest — same as before.)
-- `access_classes` / `access_grants` (for content visibility) → still present but
-  **unused by RLS**; the per-person-class explosion the grant model would have
-  required is gone.
+- `access_classes` / `access_grants` / `access_class_id` columns / the
+  `can_read_*` functions → **dropped** (Stage 4); the per-person-class explosion
+  the grant model would have required is gone. `tenant_members` stays (it feeds
+  `my_principals()`).
 
-## Migrations
+## Migrations (all applied to KnowledgeForest `sjiepibqadbdowcizccw`)
 - `20260625130000_acl_model_foundation.sql` — `my_principals` /
   `principals_for_class`, `acl` columns + GIN, backfill from grants
-  (+thread_membership for bodies), policy swap, drop thread policies.
-- `20260625140000_dedup_stamp_acl.sql` — RPC stamps + unions `acl`.
-- **Stage 4 (pending, after live verification):** a cleanup migration drops
-  `access_class_id`, `access_classes`, `access_grants`, `thread_membership`,
-  `can_read_class`, `can_read_thread*`, and rewrites the demo seed/reset.
+  (+thread_membership for bodies + email_content edges), policy swap, drop thread
+  policies.
+- `20260625140000_dedup_stamp_acl.sql` — RPC stamps + unions `acl` (transitional).
+- `20260625150000_merge_persons_global.sql` — re-key existing persons to
+  `person::{email}`, merge cross-tenant dups (union acl, repoint edges/attrs).
+- `20260625160000_dedup_acl_only.sql` — RPC drops all access_classes /
+  access_class_id references (acl only).
+- `20260625170000_drop_legacy_access_model.sql` — **Stage 4:** drop
+  `access_class_id` columns, `access_classes`, `access_grants`,
+  `thread_membership`, `can_read_class`, `can_read_thread*`.
+
+Edge functions `insert-pointer` / `ingest-document` / `ingest-batch` /
+`link-pointers` redeployed (v4) writing `acl` only.
+
+> Residual: `access.py` no longer defines the old `ensure_class`/grant helpers;
+> the demo seed/reset migrations (`20260613110000/110001`) still set the (now
+> column-less) demo rows — harmless, their acl is backfilled by the foundation
+> migration on a fresh apply.
 
 ## Verifying isolation (live)
 Under each user's identity (set the JWT claims and `role authenticated`):

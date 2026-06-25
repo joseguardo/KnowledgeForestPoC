@@ -9,7 +9,7 @@ event `regarding` those companies.
 from __future__ import annotations
 
 from pipeline.adapters.calendar import CalendarEvent
-from pipeline.adapters.calendar_entities import event_key, extract_graph
+from pipeline.adapters.calendar_entities import event_key, extract_graph, series_key
 
 TENANT = "T1"
 OWN = {"kiboventures.com"}
@@ -30,14 +30,16 @@ def _event(**kw) -> CalendarEvent:
         description="Agenda.",
         organizer=("gp@kiboventures.com", "Guillermo Puebla"),
         attendees=[("lp@poseidon.vc", "Laura Páez")],
+        recurring_event_id=None,
     )
     base.update(kw)
     return CalendarEvent(**base)
 
 
-def _graph(*events):
+def _graph(*events, name_by_email=None):
     return extract_graph(
-        list(events), crm_domains=set(CRM), crm_names=CRM, own_domains=OWN
+        list(events), crm_domains=set(CRM), crm_names=CRM, own_domains=OWN,
+        name_by_email=name_by_email or {},
     )
 
 
@@ -83,8 +85,65 @@ def test_person_label_is_name_with_email_fallback():
     g = _graph(_event(attendees=[("anon@poseidon.vc", None)]))
     persons = {e.canonical_key: e.label for e in g.entities if e.type == "person"}
     assert persons[f"person::gp@kiboventures.com"] == "Guillermo Puebla"
-    # no display name → label falls back to the address
+    # no display name, single-token local-part → label falls back to the address
     assert persons[f"person::anon@poseidon.vc"] == "anon@poseidon.vc"
+
+
+def test_resolves_names_from_directory_then_email_heuristic():
+    # Google omits displayName; resolve via graph directory first, then a
+    # confident email local-part guess, else fall back to the address.
+    g = _graph(
+        _event(
+            calendar_email="gp@kiboventures.com", owner_name=None,
+            attendees=[("lp@poseidon.vc", None), ("pablo.campos@oliverwyman.com", None)],
+        ),
+        name_by_email={"gp@kiboventures.com": "Guillermo Puebla", "lp@poseidon.vc": "Laura Páez"},
+    )
+    labels = {e.canonical_key: e.label for e in g.entities if e.type == "person"}
+    assert labels["person::gp@kiboventures.com"] == "Guillermo Puebla"        # directory
+    assert labels["person::lp@poseidon.vc"] == "Laura Páez"                   # directory
+    assert labels["person::pablo.campos@oliverwyman.com"] == "Pablo Campos"   # email heuristic
+
+
+def test_one_time_event_is_tagged_not_recurring():
+    g = _graph(_event())  # recurring_event_id=None
+    ev = next(e for e in g.entities if e.type == "event")
+    assert ev.metadata["is_recurring"] is False
+    assert ev.metadata["series_id"] is None
+    # no series node, no instance_of edge
+    assert not any("gcal-series" in e.canonical_key for e in g.entities)
+    assert not any(e.rel == "instance_of" for e in g.edges)
+
+
+def test_recurring_event_tagged_and_linked_to_series():
+    g = _graph(_event(ical_uid="uid-A", recurring_event_id="series-xyz"))
+    ev_ck = event_key(TENANT, "uid-A")
+    series_ck = series_key(TENANT, "series-xyz")
+
+    ev = next(e for e in g.entities if e.canonical_key == ev_ck)
+    assert ev.metadata["is_recurring"] is True
+    assert ev.metadata["series_id"] == "series-xyz"
+
+    series = next(e for e in g.entities if e.canonical_key == series_ck)
+    assert series.type == "event"
+    assert series.metadata["event_type"] == "meeting_series"
+    assert series.label == "Sync with Poseidon"
+
+    edges = {(e.source, e.rel, e.target) for e in g.edges}
+    assert (ev_ck, "instance_of", series_ck) in edges
+
+
+def test_recurring_occurrences_share_one_series_node():
+    g = _graph(
+        _event(ical_uid="uid-A", start="2026-06-22T10:00:00Z", recurring_event_id="series-xyz"),
+        _event(ical_uid="uid-B", start="2026-06-23T10:00:00Z", recurring_event_id="series-xyz"),
+    )
+    series_nodes = [e for e in g.entities if "gcal-series" in e.canonical_key]
+    assert len(series_nodes) == 1                       # two occurrences → one series
+    occ = [e for e in g.entities if e.type == "event" and "gcal-series" not in e.canonical_key]
+    assert len(occ) == 2                                # two distinct occurrence nodes
+    instance_edges = [e for e in g.edges if e.rel == "instance_of"]
+    assert len(instance_edges) == 2                     # each occurrence -instance_of-> series
 
 
 def test_same_event_on_two_calendars_dedups_by_ical_uid():

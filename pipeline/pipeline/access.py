@@ -7,16 +7,10 @@ import httpx
 from pipeline.config import settings
 from pipeline.errors import AdapterError
 
-# Service-role helpers for provisioning access classes + grants and resolving
-# Supabase users. Reached via PostgREST / GoTrue with the service-role key
-# (bypasses RLS). Mirrors connector_state.py's style.
-#
-# Used by the Gmail connector to enforce firm isolation + content privacy:
-#   - firm-wide tier:  class "firm:<tenant_id>"  granted to the tenant
-#   - private tier:    class "gmailthread:<tenant_id>:<hash>"  granted to users
-# The global "public" class is never used for email-derived data. Callers must
-# ensure a class exists BEFORE ingesting under it (fail closed) — an unknown key
-# would otherwise fall back to public downstream.
+# Service-role helpers reached via PostgREST / GoTrue with the service-role key
+# (bypasses RLS). Visibility itself is the per-row `acl uuid[]` (see
+# docs/handovers/access-model.md); these helpers only manage tenant membership
+# (which feeds my_principals()) and resolve user ids / pointer ids.
 
 PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001"
 
@@ -32,114 +26,6 @@ def _headers() -> dict[str, str]:
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
-
-
-async def add_thread_members(
-    http: httpx.AsyncClient,
-    tenant_id: str,
-    thread_id: str,
-    user_ids: set[str] | list[str],
-) -> None:
-    """Grant the given Supabase users read access to an email thread's bodies by
-    upserting (tenant_id, thread_id, user_id) rows into thread_membership. The
-    private `email_body` documents are gated by membership (can_read_thread), not
-    per-thread access classes. Idempotent (composite PK); no-op on empty."""
-    rows = [
-        {"tenant_id": tenant_id, "thread_id": thread_id, "user_id": uid}
-        for uid in {u for u in user_ids if u}
-    ]
-    if not rows:
-        return
-    try:
-        resp = await http.post(
-            _rest_url("thread_membership") + "?on_conflict=tenant_id,thread_id,user_id",
-            headers={**_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
-            json=rows,
-            timeout=settings.web_scrape_timeout,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise AdapterError(
-            f"thread_membership upsert HTTP {exc.response.status_code}: "
-            f"{exc.response.text[:200]}"
-        )
-    except httpx.RequestError as exc:
-        raise AdapterError(f"thread_membership upsert failed: {exc}")
-
-
-async def ensure_class(http: httpx.AsyncClient, key: str, description: str) -> str:
-    """Idempotently create the access class `key` and return its id. access_classes
-    has a UNIQUE(key), so this upserts on conflict and reads the id back."""
-    try:
-        resp = await http.post(
-            _rest_url("access_classes") + "?on_conflict=key",
-            headers={**_headers(), "Prefer": "resolution=merge-duplicates,return=representation"},
-            json={"key": key, "description": description},
-            timeout=settings.web_scrape_timeout,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise AdapterError(
-            f"access_classes upsert HTTP {exc.response.status_code}: "
-            f"{exc.response.text[:200]}"
-        )
-    except httpx.RequestError as exc:
-        raise AdapterError(f"access_classes upsert failed: {exc}")
-
-    rows: list[dict[str, Any]] = resp.json()
-    if rows and rows[0].get("id"):
-        return rows[0]["id"]
-
-    # Some PostgREST configs don't return a representation on a no-op merge; read it.
-    try:
-        get = await http.get(
-            _rest_url("access_classes"),
-            headers=_headers(),
-            params={"key": f"eq.{key}", "select": "id"},
-            timeout=settings.web_scrape_timeout,
-        )
-        get.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise AdapterError(f"access_classes read-back failed: {exc}")
-    got: list[dict[str, Any]] = get.json()
-    if not got or not got[0].get("id"):
-        raise AdapterError(f"access_classes: could not resolve id for key {key!r}")
-    return got[0]["id"]
-
-
-async def _ensure_grant(
-    http: httpx.AsyncClient, class_id: str, grantee_type: str, grantee_id: str
-) -> None:
-    """Idempotently grant `class_id` to a tenant or user. access_grants has a
-    UNIQUE(access_class_id, grantee_type, grantee_id) — ignore duplicates."""
-    try:
-        resp = await http.post(
-            _rest_url("access_grants")
-            + "?on_conflict=access_class_id,grantee_type,grantee_id",
-            headers={**_headers(), "Prefer": "resolution=ignore-duplicates"},
-            json={
-                "access_class_id": class_id,
-                "grantee_type": grantee_type,
-                "grantee_id": grantee_id,
-            },
-            timeout=settings.web_scrape_timeout,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise AdapterError(
-            f"access_grants upsert HTTP {exc.response.status_code}: "
-            f"{exc.response.text[:200]}"
-        )
-    except httpx.RequestError as exc:
-        raise AdapterError(f"access_grants upsert failed: {exc}")
-
-
-async def ensure_tenant_grant(http: httpx.AsyncClient, class_id: str, tenant_id: str) -> None:
-    await _ensure_grant(http, class_id, "tenant", tenant_id)
-
-
-async def ensure_user_grant(http: httpx.AsyncClient, class_id: str, user_id: str) -> None:
-    await _ensure_grant(http, class_id, "user", user_id)
 
 
 async def ensure_tenant_member(

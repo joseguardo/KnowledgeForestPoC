@@ -21,11 +21,22 @@ people, companies, edges *and* event-description bodies all land at the firm-wid
 
 ## Configuration
 
-Reuses **`GMAIL_FIRMS`** verbatim — same firms, same mailboxes/domain discovery,
-same SA key resolution (`load_firms()`). The SA's DWD client must additionally be
-authorized for the Calendar scope in each Workspace. Settings (`config.py`):
+Reuses **`GMAIL_FIRMS`** verbatim — same firms, same mailboxes/domain discovery.
+But calendar mints its DWD token with a **dedicated service account** (the one
+whose client id is authorized for `calendar.readonly` in the Workspace's
+domain-wide delegation — distinct from the Gmail SA). Settings (`config.py`):
 
-- `calendar_scopes` = `https://www.googleapis.com/auth/calendar.readonly`
+- `CALENDAR_SA_KEY_JSON` / `CALENDAR_SA_KEY_B64` — the calendar SA key (raw JSON /
+  path, or base64; b64 wins). **When unset, falls back to the Gmail SA**
+  (`firm.sa_info`). Resolved by `_calendar_sa_info()` in `adapters/calendar.py`
+  and threaded into `fetch_events(..., sa_info=…)`; the endpoint resolves it once
+  per request. Domain auto-discovery still uses the Gmail SA (it needs the admin
+  directory scope), so only the per-mailbox calendar fetch uses the calendar SA.
+- `calendar_scopes` = `https://www.googleapis.com/auth/calendar.readonly` (default).
+  **Gotcha:** the live `calendarbot` SA's DWD is authorized for the *full* scope
+  `…/auth/calendar`, not the readonly one, so `.env` sets
+  `CALENDAR_SCOPES=https://www.googleapis.com/auth/calendar`. The connector only
+  ever GETs, so it stays read-only in practice.
 - `calendar_backfill_days` (default 30) — first-run / non-incremental lookback.
 - `calendar_max_results` (250), `calendar_max_pages` (20) — per-calendar caps.
 
@@ -56,10 +67,21 @@ events. Pages on `nextPageToken`.
   stable across every attendee's copy of a meeting, the same meeting read from N
   calendars **collapses to one node** (edges accumulate). `occurred_at` = start;
   metadata = `{event_type:"meeting", location, end, organizer_email, provider,
-  calendar_email}`.
-- **person** per participant, keyed `person::{tenant}::{email}`, label = display
-  name with the address as fallback (calendar attendee emails are trustworthy, so
-  unlike Notes we don't require a resolvable name).
+  calendar_email, is_recurring, series_id}`.
+- **recurring meetings**: an occurrence with a `recurringEventId` is tagged
+  (`is_recurring=true`, `series_id`) and linked `event -instance_of-> series`,
+  where the **series** node is keyed `event:{tenant}:gcal-series:{recurringEventId}`
+  (type `event`, `event_type:"meeting_series"`, no attendance of its own). All
+  occurrences of one series share it; one-offs have `is_recurring=false` and no
+  series node. Note distinct series can share a title — grouping is by
+  recurringEventId, not name.
+- **person** per participant, keyed `person::{email}` (global, cross-firm). Name
+  resolution (Google usually omits attendee displayName): the provided displayName,
+  else the graph person directory `_load_person_names` (email→name from existing
+  named nodes), else the `name_from_email` heuristic (`pablo.campos@…`→"Pablo
+  Campos"; skips ambiguous initials), else the address as fallback. Everyone is
+  kept (unlike Notes, which drops the unnameable) — calendar invitees are real.
+  Re-ingesting upgrades a node's email label once a name is found.
 - **company** per *qualifying* attendee domain (CRM-known — calendar has no
   outbound-correspondence signal), keyed `company::{tenant}::{domain}`.
 - **edges**: the owner **and** every other participant relate to the event the

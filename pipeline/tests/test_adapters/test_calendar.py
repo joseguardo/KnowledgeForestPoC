@@ -7,11 +7,14 @@ records and filter the noise (cancelled / all-day / declined / solo events).
 
 from __future__ import annotations
 
+import base64
+
 from unittest.mock import AsyncMock
 
 import pytest
 
 from pipeline.adapters.calendar import CalendarEvent, events_from_calendar
+from pipeline.config import settings
 
 TENANT = "T1"
 OWNER = "gp@kiboventures.com"
@@ -119,6 +122,14 @@ def test_missing_summary_gets_placeholder_title():
     assert ev.title == "(no title)"
 
 
+def test_captures_recurring_event_id():
+    # one-off: no recurringEventId
+    assert _events(_item())[0].recurring_event_id is None
+    # recurring instance: recurringEventId carries the series id
+    ev = _events(_item(recurringEventId="series-abc"))[0]
+    assert ev.recurring_event_id == "series-abc"
+
+
 @pytest.mark.asyncio
 async def test_fetch_events_paginates_and_passes_window(monkeypatch):
     from pipeline.adapters import calendar as cal
@@ -174,7 +185,45 @@ def _firm():
 
     return GmailFirm(
         tenant_id=TENANT,
-        sa_info={"client_email": "sa@x.iam"},
+        sa_info={"client_email": "gmail-sa@x.iam"},
         mailboxes=[OWNER],
         scopes="https://www.googleapis.com/auth/calendar.readonly",
     )
+
+
+@pytest.mark.asyncio
+async def test_fetch_events_mints_with_sa_info_override(monkeypatch):
+    """A distinct calendar SA is used for the token when passed; otherwise the
+    firm's (Gmail) SA."""
+    from pipeline.adapters import calendar as cal
+
+    mint = AsyncMock(return_value="tok")
+    monkeypatch.setattr(cal, "_mint_token", mint)
+
+    async def fake_get(http, url, headers, params):
+        return {"items": []}
+    monkeypatch.setattr(cal, "_get", fake_get)
+
+    firm = _firm()
+    cal_sa = {"client_email": "calendar-sa@x.iam"}
+    await cal.fetch_events(firm, OWNER, http=AsyncMock(), sa_info=cal_sa)
+    assert mint.await_args.args[0] == cal_sa
+
+    mint.reset_mock()
+    await cal.fetch_events(firm, OWNER, http=AsyncMock())
+    assert mint.await_args.args[0] == firm.sa_info
+
+
+def test_calendar_sa_info_prefers_b64_then_json_then_none(monkeypatch):
+    from pipeline.adapters import calendar as cal
+
+    monkeypatch.setattr(settings, "calendar_sa_key_b64", None, raising=False)
+    monkeypatch.setattr(settings, "calendar_sa_key_json", None, raising=False)
+    assert cal._calendar_sa_info() is None
+
+    monkeypatch.setattr(
+        settings, "calendar_sa_key_b64",
+        base64.b64encode(b'{"client_email": "calendar-sa@x.iam"}').decode(),
+        raising=False,
+    )
+    assert cal._calendar_sa_info() == {"client_email": "calendar-sa@x.iam"}

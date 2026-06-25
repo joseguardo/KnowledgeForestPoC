@@ -21,7 +21,10 @@ from pipeline.adapters.affinidad import (
     event_key,
     load_affinidad_firms,
 )
-from pipeline.adapters.calendar import fetch_events as fetch_calendar_events
+from pipeline.adapters.calendar import (
+    _calendar_sa_info,
+    fetch_events as fetch_calendar_events,
+)
 from pipeline.adapters.calendar_entities import (
     event_key as calendar_event_key,
     extract_graph as extract_calendar_graph,
@@ -478,6 +481,9 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
 
     firms = load_firms(body.tenant_id)
     explicit_mailboxes = frozenset(m.lower() for f in load_firms() for m in f.mailboxes)
+    # Calendar runs on its own SA (calendar.readonly DWD authorized there), the
+    # firm/mailbox config stays shared. None → fall back to the firm's Gmail SA.
+    calendar_sa = _calendar_sa_info()
 
     results: list[EdgeFunctionResult] = []
     errors: list[IngestError] = []
@@ -488,6 +494,9 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         # firm:{tenant} → acl=[tenant] at the write boundary; no class/grant rows.
 
         crm_names = await _load_company_domains(http, firm.tenant_id)
+        # email → name directory (existing named person nodes), so calendar
+        # attendees resolve to real names even when Google omits displayName.
+        name_by_email = await _load_person_names(http, firm.tenant_id)
         own_domains = {m.split("@", 1)[1].lower() for m in firm.mailboxes if "@" in m}
         if firm.domain:
             own_domains.add(firm.domain.lower())
@@ -525,7 +534,8 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                 updated_min = await get_cursor(http, cursor_key)
             try:
                 evs = await fetch_calendar_events(
-                    firm, mailbox, http, updated_min=updated_min, max_results=body.max_results
+                    firm, mailbox, http, updated_min=updated_min,
+                    max_results=body.max_results, sa_info=calendar_sa,
                 )
             except (AdapterError, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -539,6 +549,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
             crm_domains=set(crm_names),
             crm_names=crm_names,
             own_domains=own_domains,
+            name_by_email=name_by_email,
         )
         id_by_key: dict[str, str] = {}
         for ent in graph.entities:

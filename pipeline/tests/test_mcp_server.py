@@ -141,16 +141,6 @@ async def test_ingest_document_uses_per_user_class(monkeypatch):
 
     calls = {}
 
-    async def fake_ensure_class(http, key, desc):
-        calls["class_key"] = key
-        return "class-id-9"
-
-    async def fake_ensure_user_grant(http, class_id, uid):
-        calls["grant"] = (class_id, uid)
-
-    monkeypatch.setattr(ing, "ensure_class", fake_ensure_class)
-    monkeypatch.setattr(ing, "ensure_user_grant", fake_ensure_user_grant)
-
     class FakeClient:
         def __init__(self, **kw):
             pass
@@ -163,9 +153,8 @@ async def test_ingest_document_uses_per_user_class(monkeypatch):
     monkeypatch.setattr(_runtime, "_http", httpx.AsyncClient())
 
     out = await ing.ingest_document(title="Note", content="body")
-    assert calls["class_key"] == "user:u9"
-    assert calls["grant"] == ("class-id-9", "u9")
-    assert calls["access_class"] == "user:u9"  # never "public"
+    # access_class user:{uid} → acl=[uid] at the write boundary (never public)
+    assert calls["access_class"] == "user:u9"
     assert out["access_class"] == "user:u9"
     assert out["pointer_id"] == "ptr-1"
 

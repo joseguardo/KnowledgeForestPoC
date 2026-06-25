@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     # mailbox's `primary` calendar is read; the same meeting on N attendees'
     # calendars dedups to one event node by iCalUID.
     calendar_scopes: str = "https://www.googleapis.com/auth/calendar.readonly"
+    # Calendar uses its OWN service account, distinct from Gmail's: calendar.readonly
+    # domain-wide delegation is authorized on this SA's client id, not the Gmail
+    # one. Same two forms as the Gmail key — raw JSON string / path, or base64
+    # (takes precedence). When unset, the calendar connector falls back to the
+    # Gmail SA (firm.sa_info). The firm/mailbox config (GMAIL_FIRMS) is shared.
+    calendar_sa_key_json: str | None = None
+    calendar_sa_key_b64: str | None = None
     # First-run lookback window (days). timeMin = now - this; no timeMax (upcoming
     # events are ingested too). Incremental runs add updatedMin = cursor.
     calendar_backfill_days: int = 30
