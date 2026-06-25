@@ -150,7 +150,9 @@ def company_key(tenant: str, domain: str | None, entity_id: str) -> str:
 
 def person_key(tenant: str, email: str | None, entity_id: str) -> str:
     e = (email or "").strip().lower()
-    return f"person::{tenant}::{e}" if e else f"person::{tenant}::id:{entity_id}"
+    # Email-keyed persons are GLOBAL (cross-tenant shared identity); the no-email
+    # id-fallback stays tenant-scoped (can't be matched across firms).
+    return f"person::{e}" if e else f"person::{tenant}::id:{entity_id}"
 
 
 def event_key(tenant: str, event_id: str) -> str:

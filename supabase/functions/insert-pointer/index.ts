@@ -12,16 +12,28 @@ interface InsertPointerRequest {
   canonical_key?: string;
   metadata?: Record<string, unknown>;
   occurred_at?: string;
-  // Access class (security level) the ingesting process assigns to this record.
-  // Defaults to "public". A per-attribute `access_class` overrides it for that row.
+  // Access class the ingesting process assigns. Defaults to "public". Translated
+  // to the row's acl[] (principals that may read it). `principals` overrides it
+  // with an explicit set (e.g. body participants). Per-attribute overrides too.
   access_class?: string;
-  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string }[];
+  principals?: string[];
+  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string; principals?: string[] }[];
 }
 
 const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
 
-// Resolve access-class keys -> ids once per request, so attribute/chunk/edge
-// rows can be stamped. (The pointer itself is stamped inside the RPC.)
+// Translate a named access-class key to its principal set (mirrors the SQL
+// principals_for_class): public->sentinel, firm:{uuid}/user:{uuid}->[uuid],
+// unknown->[] (fail-closed).
+function principalsForClass(key?: string): string[] {
+  if (!key || key === "public") return [PUBLIC_CLASS_ID];
+  if (key.startsWith("firm:")) return [key.slice(5)];
+  if (key.startsWith("user:")) return [key.slice(5)];
+  return [];
+}
+
+// Resolve access-class keys -> ids once per request (still stamped on attribute
+// rows during the transition; RLS uses acl).
 async function classResolver(supabase: ReturnType<typeof createClient>) {
   const { data } = await supabase.from("access_classes").select("id,key");
   const idByKey: Record<string, string> = {};
@@ -86,8 +98,9 @@ Deno.serve(async (req: Request) => {
 
     const resolveClass = await classResolver(supabase);
     const pointerClass = body.access_class || "public";
+    const pointerPrincipals = body.principals ?? principalsForClass(pointerClass);
 
-    // Call the dedup-aware insert RPC (it stamps the pointer's access class)
+    // Call the dedup-aware insert RPC (it stamps the pointer's acl + unions on merge)
     const { data: result, error: rpcError } = await supabase.rpc(
       "insert_pointer_with_dedup",
       {
@@ -97,6 +110,7 @@ Deno.serve(async (req: Request) => {
         p_metadata: body.metadata || {},
         p_embedding: embedding ? JSON.stringify(embedding) : null,
         p_access_class: pointerClass,
+        p_acl: pointerPrincipals,
       }
     );
 
@@ -120,6 +134,7 @@ Deno.serve(async (req: Request) => {
         source: attr.source || "api",
         // Per-attribute class override, else the pointer's class.
         access_class_id: resolveClass(attr.access_class || pointerClass),
+        acl: attr.principals ?? (attr.access_class ? principalsForClass(attr.access_class) : pointerPrincipals),
         updated_at: new Date().toISOString(),
       }));
 

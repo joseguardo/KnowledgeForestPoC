@@ -78,6 +78,19 @@ def test_to_note_resolves_owner_email_and_dedups_attendees():
     assert "Action Items" in note.body
 
 
+def test_to_note_captures_scheduled_at_from_title():
+    # The trailing ISO in the raw title is the meeting's scheduled slot — captured
+    # for meeting-identity dedup, while the label is still cleaned of it.
+    note = _to_note(_firm(), _row(), {})
+    assert note.scheduled_at == "2026-06-19T11:00:00+02:00"
+    assert note.title == "Ext. Call Poseidon"
+
+
+def test_to_note_scheduled_at_none_without_iso():
+    note = _to_note(_firm(), _row(title="CDD Entrevista Grupo Viamed"), {})
+    assert note.scheduled_at is None
+
+
 def test_to_note_confidential_and_empty_body():
     note = _to_note(_firm(), _row(confidential="Confidential", notion_summary=None), {})
     assert note.confidential is True
@@ -165,3 +178,9 @@ async def test_fetch_notes_maps_rows_resolves_owner_and_exposes_own_domains():
     # own_domains derived from the firm's team-table emails (treats colleagues as
     # person-only downstream, never as companies).
     assert fetched.own_domains == {"kiboventures.com", "nzalpha.com"}
+    # team_names: email → name, so internal colleagues attending get a real-name
+    # person label (not the bare email).
+    assert fetched.team_names == {
+        "gpa@kiboventures.com": "Guillermo Puebla",
+        "nadia@nzalpha.com": "Nadia Z",
+    }

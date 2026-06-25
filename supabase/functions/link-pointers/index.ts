@@ -13,7 +13,13 @@ interface LinkRequest {
   why?: string;
   payload?: Record<string, unknown>;
   weight?: number;
+  // Principals (acl) for this edge — the relationship's tenant(s). Defaults to
+  // public; the RLS edges_read also requires both endpoints visible, so a public
+  // edge between two private pointers still can't be read.
+  principals?: string[];
 }
+
+const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -68,6 +74,7 @@ Deno.serve(async (req: Request) => {
         why: body.why || null,
         payload: body.payload || {},
         weight: body.weight || 1.0,
+        acl: (body.principals && body.principals.length) ? body.principals : [PUBLIC_CLASS_ID],
       })
       .select()
       .single();

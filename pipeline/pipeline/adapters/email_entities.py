@@ -126,6 +126,9 @@ class Entity:
     label: str
     occurred_at: str | None = None
     metadata: dict = field(default_factory=dict)
+    # insert-pointer attribute rows: {"key","value","data_type","source"}.
+    # Used by notes to store a person's email as an attribute, not the label.
+    attributes: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -230,7 +233,7 @@ def extract_graph(
         )
         person_ck = company_ck = None
         if c.person:
-            person_ck = f"person::{tenant}::{c.person.email}"
+            person_ck = f"person::{c.person.email}"  # global identity (cross-tenant)
             add_entity(Entity(person_ck, "person", c.person.name or c.person.email))
         if c.company:
             company_ck = f"company::{tenant}::{c.company.domain}"

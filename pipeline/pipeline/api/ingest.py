@@ -25,9 +25,14 @@ from pipeline.adapters.affinidad import (
     event_key,
     load_affinidad_firms,
 )
+from pipeline.adapters.calendar import fetch_events as fetch_calendar_events
+from pipeline.adapters.calendar_entities import (
+    event_key as calendar_event_key,
+    extract_graph as extract_calendar_graph,
+)
 from pipeline.adapters.conversation import ConversationAdapter
 from pipeline.adapters.document import DocumentAdapter
-from pipeline.adapters.email_entities import extract_graph, message_key
+from pipeline.adapters.email_entities import _looks_like_email, extract_graph, message_key
 from pipeline.adapters.gmail import (
     GmailAdapter,
     _truncate_utf16,
@@ -42,6 +47,7 @@ from pipeline.adapters.notes import (
 )
 from pipeline.adapters.notes_entities import (
     build_company_index,
+    event_key as notes_event_key,
     extract_graph as extract_notes_graph,
 )
 try:
@@ -68,6 +74,7 @@ from pipeline.errors import (
 )
 from pipeline.models import (
     AffinidadRequest,
+    CalendarRequest,
     ConversationRequest,
     DocumentRequest,
     EdgeFunctionResult,
@@ -239,6 +246,38 @@ async def _load_company_domains(http, tenant_id: str) -> dict[str, str]:
     return out
 
 
+async def _load_person_names(http, tenant_id: str) -> dict[str, str]:
+    """Named person nodes as {email: name} — the cross-tenant person directory.
+
+    Persons are now keyed globally `person::{email}` (the tenant_id arg is kept
+    for signature stability but no longer filters). Read over PostgREST
+    (service-role key); the tenant-scoped `id:` fallback keys (`person::{tenant}::
+    id:…`, which contain a second `::`) and nodes still labelled with a bare email
+    are excluded. Used to label an attendee with a real name; no name → dropped."""
+    key = settings.supabase_service_role_key
+    prefix = "person::"
+    resp = await http.get(
+        f"{settings.supabase_url}/rest/v1/pointers",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"},
+        params={"type": "eq.person", "select": "canonical_key,label"},
+        timeout=settings.web_scrape_timeout,
+    )
+    resp.raise_for_status()
+    out: dict[str, str] = {}
+    for row in resp.json():
+        ck = row.get("canonical_key") or ""
+        if not ck.startswith(prefix):
+            continue
+        email = ck[len(prefix):].strip().lower()
+        # Skip tenant-scoped id-fallbacks (person::{tenant}::id:…) — not global emails.
+        if "::" in email or not email or email.startswith("id:"):
+            continue
+        label = (row.get("label") or "").strip()
+        if label and not _looks_like_email(label):
+            out[email] = label
+    return out
+
+
 @router.post("/gmail", response_model=IngestResponse)
 async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
     """Multi-tenant Gmail ingestion. Per firm (tenant) × mailbox, fetch messages
@@ -341,6 +380,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
                     metadata=ent.metadata or None,
                     occurred_at=ent.occurred_at,
                     access_class=firm_class_key,
+                    attributes=ent.attributes or None,
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(idx, exc))
@@ -387,13 +427,14 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
                 content = _truncate_utf16(content, settings.max_content_length)
             idx = len(results) + len(errors)
             try:
-                member_uids = {
+                member_uids = sorted({
                     uid for uid in (
                         user_ids.get(a)
                         for a in {m.sender[0], *(a for a, _ in m.to), *(a for a, _ in m.cc)}
                     ) if uid
-                }
-                await add_thread_members(http, m.tenant_id, m.thread_id, member_uids)
+                })
+                # Body visibility = the thread participants who have accounts (acl),
+                # replacing the email_body class + thread_membership table.
                 await client.ingest_document(
                     title=m.subject or "(no subject)",
                     content=content,
@@ -404,7 +445,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
                         "mailbox": m.mailbox,
                         "gmail_message_id": m.message_id,
                     },
-                    access_class="email_body",
+                    principals=member_uids,
                     canonical_key_namespace=m.tenant_id,
                     link={
                         "target_id": pid,
@@ -422,6 +463,169 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
     elapsed = int((time.monotonic() - start) * 1000)
     return IngestResponse(
         source_type="gmail",
+        items_produced=produced,
+        results=results,
+        errors=errors,
+        duration_ms=elapsed,
+    )
+
+
+@router.post("/calendar", response_model=IngestResponse)
+async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResponse:
+    """Multi-tenant Google Calendar ingestion. Reuses the Gmail service account +
+    GMAIL_FIRMS config: per firm × mailbox, read the mailbox's `primary` calendar
+    and build the graph: one firm-wide `event` per meeting (deduped across
+    attendees by iCalUID), person/company entities (CRM-reconciled),
+    `attended`/`attended_by`/`affiliated_with`/`regarding` edges, and a firm-wide
+    description document. No per-user privacy — everyone in the firm sees every
+    calendar. Recurrent when `since_last` (per-mailbox `updatedMin` cursor)."""
+    start = time.monotonic()
+    http = request.app.state.http
+    client: EdgeFunctionClient = request.app.state.client
+
+    firms = load_firms(body.tenant_id)
+    explicit_mailboxes = frozenset(m.lower() for f in load_firms() for m in f.mailboxes)
+
+    results: list[EdgeFunctionResult] = []
+    errors: list[IngestError] = []
+    produced = 0
+
+    for firm in firms:
+        firm_class_key = f"firm:{firm.tenant_id}"
+        firm_class_id = await ensure_class(
+            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
+        )
+        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+
+        crm_names = await _load_company_domains(http, firm.tenant_id)
+        own_domains = {m.split("@", 1)[1].lower() for m in firm.mailboxes if "@" in m}
+        if firm.domain:
+            own_domains.add(firm.domain.lower())
+
+        # Mailbox selection mirrors Gmail (subject scoping + shared-Workspace
+        # carve-out): an explicit subject is trusted when tenant_id pins the firm,
+        # else only the firm that owns the address acts; no subject → the firm's
+        # mailbox list, or domain auto-discovery (excluding addresses another firm
+        # claimed explicitly).
+        if body.subject:
+            want = body.subject.strip().lower()
+            if body.tenant_id:
+                mailboxes = [want]
+            elif want in {m.lower() for m in firm.mailboxes} or (
+                firm.domain is not None and want.endswith("@" + firm.domain.lower())
+            ):
+                mailboxes = [want]
+            else:
+                mailboxes = []
+        else:
+            mailboxes = firm.mailboxes or await discover_mailboxes(
+                firm, http, exclude=explicit_mailboxes
+            )
+
+        # Phase A: collect all events for the firm, advancing per-mailbox cursors.
+        events = []
+        cursor_marks: list[tuple[str, str]] = []
+        for mailbox in mailboxes:
+            if "@" in mailbox:
+                own_domains.add(mailbox.split("@", 1)[1].lower())
+            cursor_key = f"google-calendar:{firm.tenant_id}:{mailbox}"
+            run_started = datetime.now(timezone.utc).isoformat()
+            updated_min = None
+            if body.since_last:
+                updated_min = await get_cursor(http, cursor_key)
+            try:
+                evs = await fetch_calendar_events(
+                    firm, mailbox, http, updated_min=updated_min, max_results=body.max_results
+                )
+            except (AdapterError, ValidationError) as exc:
+                errors.append(_error_from_exc(len(results) + len(errors), exc))
+                continue
+            events.extend(evs)
+            cursor_marks.append((cursor_key, run_started))
+
+        # Phase B: deterministic extraction, then write entities + edges.
+        graph = extract_calendar_graph(
+            events,
+            crm_domains=set(crm_names),
+            crm_names=crm_names,
+            own_domains=own_domains,
+        )
+        id_by_key: dict[str, str] = {}
+        for ent in graph.entities:
+            idx = len(results) + len(errors)
+            try:
+                resp = await client.insert_pointer(
+                    label=ent.label,
+                    type=ent.type,
+                    canonical_key=ent.canonical_key,
+                    metadata=ent.metadata or None,
+                    occurred_at=ent.occurred_at,
+                    access_class=firm_class_key,
+                    attributes=ent.attributes or None,
+                )
+            except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                errors.append(_error_from_exc(idx, exc))
+                continue
+            pid = resp.get("pointer_id")
+            if pid:
+                id_by_key[ent.canonical_key] = pid
+                produced += 1
+                results.append(
+                    EdgeFunctionResult(index=idx, status=resp.get("status", "unknown"), pointer_id=pid)
+                )
+
+        for edge in graph.edges:
+            src = id_by_key.get(edge.source)
+            tgt = id_by_key.get(edge.target)
+            if not src or not tgt:
+                continue
+            try:
+                await client.link_pointers(
+                    source_id=src, target_id=tgt,
+                    relationship_type=edge.rel, why=edge.why,
+                )
+            except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+        # Phase C: descriptions. One firm-wide document per event with body text
+        # (deduped by iCalUID across calendars), linked to its event node.
+        ev_by_key: dict[str, object] = {}
+        for ev in events:
+            if ev.description:
+                ev_by_key.setdefault(calendar_event_key(ev.tenant_id, ev.ical_uid), ev)
+        for key, ev in ev_by_key.items():
+            pid = id_by_key.get(key)
+            if not pid:
+                continue
+            idx = len(results) + len(errors)
+            try:
+                await client.ingest_document(
+                    title=ev.title,
+                    content=ev.description,
+                    occurred_at=ev.start,
+                    metadata={
+                        "tenant_id": ev.tenant_id,
+                        "provider": "google-calendar",
+                        "ical_uid": ev.ical_uid,
+                    },
+                    access_class=firm_class_key,
+                    canonical_key_namespace=ev.tenant_id,
+                    link={
+                        "target_id": pid,
+                        "relationship_type": "event_details",
+                        "why": "Description of this calendar event",
+                    },
+                )
+            except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                errors.append(_error_from_exc(idx, exc))
+
+        if body.since_last:
+            for cursor_key, mark in cursor_marks:
+                await set_cursor(http, cursor_key, mark)
+
+    elapsed = int((time.monotonic() - start) * 1000)
+    return IngestResponse(
+        source_type="calendar",
         items_produced=produced,
         results=results,
         errors=errors,
@@ -470,12 +674,19 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
         # CRM company domains/names, so attendee domains + free-text external_org
         # resolve onto the existing `company::{tenant}::{domain}` nodes.
         crm_names = await _load_company_domains(http, firm.tenant_id)
+        # email → name directory: the firm's team table (internal colleagues) plus
+        # named CRM/graph person nodes. An attendee with no name here is dropped.
+        name_by_email = {
+            **await _load_person_names(http, firm.tenant_id),
+            **fetched.team_names,
+        }
         graph = extract_notes_graph(
             notes,
             crm_domains=set(crm_names),
             crm_names=crm_names,
             name_to_domain=build_company_index(crm_names),
             own_domains=fetched.own_domains,
+            name_by_email=name_by_email,
         )
 
         # Phase B: deterministic extraction → entities, then edges (mirror Gmail).
@@ -490,6 +701,7 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
                     metadata=ent.metadata or None,
                     occurred_at=ent.occurred_at,
                     access_class=firm_class_key,
+                    attributes=ent.attributes or None,
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(idx, exc))
@@ -564,26 +776,21 @@ async def _ingest_note_body(
     id_by_key: dict[str, str],
 ) -> None:
     """Ingest a meeting's summary as a document linked to its event node.
-    Firm-wide unless Confidential → a private class ensured BEFORE ingest (fail
-    closed) and granted to the owner + attendees who have platform accounts."""
+    Firm-wide (acl = [tenant]) unless Confidential → acl = the owner + attendees
+    who have platform accounts (their uids), so only they can read it."""
     tenant = note.tenant_id
     start = note.occurred_at or note.last_edited
-    event_id = id_by_key.get(f"event:{tenant}:meetingnote:{note.page_id}")
+    event_id = id_by_key.get(notes_event_key(tenant, note))
 
+    body_access_class: str | None = None
+    principals: list[str] | None = None
     if note.confidential:
-        body_class = f"meetingnote:{tenant}:{note.page_id}"
-        private_id = await ensure_class(
-            http, body_class, f"Confidential meeting note {note.page_id} (tenant {tenant})"
-        )
         grant_emails = set(note.attendees)
         if note.owner_email:
             grant_emails.add(note.owner_email)
-        for email_addr in grant_emails:
-            uid = user_ids.get(email_addr)
-            if uid:
-                await ensure_user_grant(http, private_id, uid)
+        principals = [uid for uid in (user_ids.get(e) for e in grant_emails) if uid]
     else:
-        body_class = firm_class_key
+        body_access_class = firm_class_key  # firm:{tenant} → acl [tenant]
 
     link = (
         {
@@ -599,7 +806,8 @@ async def _ingest_note_body(
         content=note.body,
         occurred_at=start,
         metadata={"page_id": note.page_id, "confidential": note.confidential},
-        access_class=body_class,
+        access_class=body_access_class,
+        principals=principals,
         canonical_key_namespace=tenant,
         link=link,
     )
@@ -737,17 +945,14 @@ async def _ingest_crm_note(
     """One note → a document, firm-wide unless private (then a per-note class
     ensured + granted to the author BEFORE ingest), plus note_about edges to each
     linked entity that resolves to a pointer."""
+    body_access_class: str | None = None
+    principals: list[str] | None = None
     if note.private:
-        body_class = f"affinidadnote:{note.tenant_id}:{note.note_id}"
-        class_id = await ensure_class(
-            http, body_class, f"Private CRM note {note.note_id} (tenant {note.tenant_id})"
-        )
-        if note.author_email:
-            uid = user_ids.get(note.author_email)
-            if uid:
-                await ensure_user_grant(http, class_id, uid)
+        # acl = the author (if they have an account), else nobody (fail-closed).
+        uid = user_ids.get(note.author_email) if note.author_email else None
+        principals = [uid] if uid else []
     else:
-        body_class = firm_class_key
+        body_access_class = firm_class_key
 
     doc = await client.ingest_document(
         title=note.label,
@@ -758,7 +963,8 @@ async def _ingest_crm_note(
             "note_id": note.note_id,
             "visibility": "private" if note.private else "org",
         },
-        access_class=body_class,
+        access_class=body_access_class,
+        principals=principals,
         canonical_key_namespace=note.tenant_id,
     )
     doc_id = doc.get("pointer_id")
@@ -809,17 +1015,14 @@ async def _ingest_crm_event(
             )
 
     if ev.body:
-        body_class = f"affinidadevent:{ev.tenant_id}:{ev.event_id}"
-        class_id = await ensure_class(
-            http, body_class,
-            f"Participant-only {ev.type} body {ev.event_id} (tenant {ev.tenant_id})",
-        )
+        # acl = the participants who have accounts (fail-closed if none).
+        principals = []
         for (_etype, entity_id, _role) in ev.participants:
             ent = entity_by_id.get(entity_id)
             email = getattr(ent, "email", None) if ent else None
             uid = user_ids.get(email) if email else None
             if uid:
-                await ensure_user_grant(http, class_id, uid)
+                principals.append(uid)
         rel = "email_content" if ev.type == "email" else "meeting_notes"
         link = (
             {"target_id": event_id, "relationship_type": rel, "why": f"Body of this {ev.type}"}
@@ -834,7 +1037,7 @@ async def _ingest_crm_event(
             content=content,
             occurred_at=ev.occurred_at,
             metadata={"source": "affinidad", "event_id": ev.event_id, "event_type": ev.type},
-            access_class=body_class,
+            principals=principals,
             canonical_key_namespace=ev.tenant_id,
             link=link,
         )

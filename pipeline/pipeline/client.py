@@ -83,6 +83,7 @@ class EdgeFunctionClient:
         occurred_at: str | None = None,
         access_class: str | None = None,
         attributes: list[dict] | None = None,
+        principals: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"label": label, "type": type}
         if canonical_key is not None:
@@ -95,6 +96,8 @@ class EdgeFunctionClient:
             payload["access_class"] = access_class
         if attributes:
             payload["attributes"] = attributes
+        if principals is not None:
+            payload["principals"] = principals
         return await self._call("insert-pointer", payload)
 
     async def ingest_document(
@@ -108,6 +111,7 @@ class EdgeFunctionClient:
         access_class: str | None = None,
         canonical_key_namespace: str | None = None,
         link: dict | None = None,
+        principals: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"title": title, "content": content}
         if occurred_at:
@@ -122,6 +126,8 @@ class EdgeFunctionClient:
             payload["canonical_key_namespace"] = canonical_key_namespace
         if link:
             payload["link"] = link
+        if principals is not None:
+            payload["principals"] = principals
         return await self._call("ingest-document", payload)
 
     async def link_pointers(
@@ -133,6 +139,7 @@ class EdgeFunctionClient:
         why: str | None = None,
         payload: dict | None = None,
         weight: float | None = None,
+        principals: list[str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"source_id": source_id, "target_id": target_id}
         if relationship_type:
@@ -143,6 +150,8 @@ class EdgeFunctionClient:
             body["payload"] = payload
         if weight is not None:
             body["weight"] = weight
+        if principals is not None:
+            body["principals"] = principals
         return await self._call("link-pointers", body)
 
     async def ingest_batch(
@@ -151,12 +160,15 @@ class EdgeFunctionClient:
         items: list[dict[str, Any]],
         source: str | None = None,
         access_class: str | None = None,
+        principals: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"items": items}
         if source:
             payload["source"] = source
         if access_class:
             payload["access_class"] = access_class
+        if principals is not None:
+            payload["principals"] = principals
         return await self._call("ingest-batch", payload)
 
 

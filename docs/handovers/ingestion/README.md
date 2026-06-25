@@ -18,13 +18,19 @@ Every adapter normalizes to `NormalizedItem` (`pipeline/pipeline/models.py`) —
 
 **Identity & dedup:** the `insert_pointer_with_dedup` RPC merges on a matching
 `canonical_key`; trigram+embedding similarity only flags lookalikes for review.
-**Access:** every row carries an `access_class_id`; `can_read_class()` RLS gates
-on `public` / per-user grant / per-tenant grant. Class keys: `firm:{tenant}`
-(public-within-firm) and per-record private keys.
+**Access:** every row carries `acl uuid[]` — the principals (tenant ids, user
+ids, public sentinel) that may read it — and RLS is `acl && (select
+my_principals())`. People are one **global** `person::{email}` node across firms;
+each firm's ingest unions its tenant into the node's acl, while edges/attributes
+stay per-tenant. See [access-model.md](../access-model.md). (The legacy
+`access_class_id`/`can_read_class`/`thread_membership` are superseded, pending a
+cleanup migration.)
 
 ## Sources
 
 - **Gmail** — Workspace threads (`adapters/gmail.py`). See [emails.md](emails.md).
+- **Calendar** — Workspace primary calendars, same SA as Gmail
+  (`adapters/calendar.py`). Firm-wide events; see [calendar.md](calendar.md).
 - **Notes** — `meeting_transcripts` from a source Supabase (`adapters/notes.py`).
   See [notes.md](notes.md).
 - **Affinidad** — Kibo's in-house CRM Postgres (`adapters/affinidad.py`); the

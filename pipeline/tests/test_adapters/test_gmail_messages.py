@@ -127,6 +127,16 @@ def test_single_token_brandy_display_name_is_dropped():
     assert _flatten(_human(sender="Fun.xyz <fun@swapped.com>")) == []
 
 
+def test_role_mailbox_sender_is_dropped():
+    for lp in ("info", "sales", "marketing", "newsletter"):
+        assert _flatten(_human(sender=f"South Summit <{lp}@southsummit.io>")) == [], lp
+
+
+def test_role_mailbox_recipient_does_not_drop_human_message():
+    # a role mailbox as a recipient must not drop a genuine human-sent message
+    assert len(_flatten(_human(to="info@acme.com"))) == 1
+
+
 def test_real_single_name_is_kept():
     assert len(_flatten(_human(sender="Matthias <matthias@firm.com>"))) == 1
 

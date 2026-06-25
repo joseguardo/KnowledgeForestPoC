@@ -71,6 +71,7 @@ class MeetingNote:
     external_org: str | None  # raw free-text org the meeting is "about"; resolved downstream
     confidential: bool
     body: str  # joined content_fields; "" when none present
+    scheduled_at: str | None = None  # meeting's scheduled slot, parsed from the raw title
 
 
 @dataclass
@@ -81,6 +82,7 @@ class NotesFetch:
 
     notes: list[MeetingNote]
     own_domains: set[str]
+    team_names: dict[str, str]  # email → name (firm team directory), for person labels
 
 
 def load_notes_firms(tenant_id: str | None = None) -> list[NotesFirm]:
@@ -180,7 +182,7 @@ class NotesAdapter:
         except Exception as exc:  # asyncpg + DNS/auth errors
             raise AdapterError(f"Notes source connection failed: {exc}")
         try:
-            owner_map = await _fetch_owner_email_map(conn, firm)
+            owner_map, team_names = await _fetch_owner_email_map(conn, firm)
             rows = await _fetch_rows(conn, firm, since, cap)
         except AdapterError:
             raise
@@ -197,25 +199,29 @@ class NotesAdapter:
             em.split("@", 1)[1] for em in owner_map.values() if "@" in em
         }
         notes = [_to_note(firm, dict(r), owner_map) for r in rows]
-        return NotesFetch(notes=notes, own_domains=own_domains)
+        return NotesFetch(notes=notes, own_domains=own_domains, team_names=team_names)
 
 
-async def _fetch_owner_email_map(conn: Any, firm: NotesFirm) -> dict[str, str]:
-    """{lower(name): lower(email)} across the configured team tables. Lets the
-    owner (a name in meeting_transcripts) be keyed by email like an attendee, so
-    the same person is never split into a name-node and an email-node."""
-    mapping: dict[str, str] = {}
+async def _fetch_owner_email_map(conn: Any, firm: NotesFirm) -> tuple[dict[str, str], dict[str, str]]:
+    """Read the firm's team directory once, returning two views:
+      - owner_map  {lower(name): lower(email)} — resolves a meeting's owner
+        (a name) to an email, so the same person is keyed by email, not split.
+      - team_names {lower(email): name} — the inverse, original-case name, so an
+        internal colleague who attends gets a real-name person label."""
+    owner_map: dict[str, str] = {}
+    team_names: dict[str, str] = {}
     for t in firm.owner_map_tables:
         sql = (
             f'SELECT "{t["name_col"]}" AS nm, "{t["email_col"]}" AS em '
             f'FROM "{t["table"]}" WHERE "{t["email_col"]}" IS NOT NULL'
         )
         for r in await conn.fetch(sql):
-            nm = (r["nm"] or "").strip().lower()
+            nm_raw = (r["nm"] or "").strip()
             em = (r["em"] or "").strip().lower()
-            if nm and em:
-                mapping.setdefault(nm, em)
-    return mapping
+            if nm_raw and em:
+                owner_map.setdefault(nm_raw.lower(), em)
+                team_names.setdefault(em, nm_raw)
+    return owner_map, team_names
 
 
 async def _fetch_rows(conn: Any, firm: NotesFirm, since: str | None, cap: int) -> list[Any]:
@@ -271,6 +277,7 @@ def _to_note(firm: NotesFirm, row: dict[str, Any], owner_map: dict[str, str]) ->
         tenant_id=firm.tenant_id,
         page_id=str(row["page_id"]),
         title=_clean_title(row.get("title")),
+        scheduled_at=_scheduled_from_title(row.get("title")),
         occurred_at=_iso(row.get("meeting_start")),
         last_edited=_iso(row.get("last_edited_time")),
         owner_name=owner_name,
@@ -291,6 +298,22 @@ def _clean_title(title: str | None) -> str:
     if not title:
         return "Meeting"
     return _RE_TRAILING_ISO.sub("", str(title).strip()).strip() or "Meeting"
+
+
+def _scheduled_from_title(title: str | None) -> str | None:
+    """The meeting's scheduled slot = the trailing ISO datetime Notion appends to
+    the title (the same value across both note-pages of one meeting). Returns a
+    normalized ISO string, or None when the title carries no such timestamp."""
+    if not title:
+        return None
+    m = _RE_TRAILING_ISO.search(str(title))
+    if not m:
+        return None
+    raw = m.group(0).strip()
+    try:
+        return datetime.fromisoformat(raw).isoformat()
+    except ValueError:
+        return raw or None
 
 
 def _iso(value: Any) -> str | None:

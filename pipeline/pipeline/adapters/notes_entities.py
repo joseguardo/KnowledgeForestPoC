@@ -25,6 +25,7 @@ spellings collapse onto the single `company::{tenant}::{domain}` node.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import TYPE_CHECKING
 
@@ -76,6 +77,53 @@ def resolve_company_domain(external_org: str | None, name_to_domain: dict[str, s
     return name_to_domain.get(key) if key else None
 
 
+# Generic / role local-part tokens that aren't personal names — a `sales.team@`
+# or `info.madrid@` must not be parsed into a "person".
+_GENERIC_LOCALPARTS = frozenset({
+    "no", "reply", "noreply", "donotreply", "info", "sales", "support", "admin",
+    "contact", "hello", "team", "marketing", "newsletter", "news", "accounts",
+    "billing", "help", "office", "hr", "jobs", "careers", "press", "events",
+    "booking", "bookings", "invite", "invites", "mail", "mailer", "daemon",
+    "postmaster", "notifications", "notify", "alerts",
+})
+# A name token: ≥2 unicode letters, no digits/underscore (so initials and
+# digit-bearing handles are rejected).
+_NAME_TOKEN = re.compile(r"^[^\W\d_]{2,}$")
+
+
+def name_from_email(addr: str | None) -> str | None:
+    """Extract a human name from an email local-part *when confident*, else None.
+
+    `pablo.campos@…` → "Pablo Campos"; `jose.carazo@…` → "Jose Carazo". Drops when
+    unsure: a single mashed token (`claudiagarcia@…`), an initial (`j.carazo@…`),
+    digits, or a generic/role word (`sales.team@…`). Conservative on purpose —
+    the precedence is the team/CRM directory first, this heuristic second, then
+    drop. The `+tag` suffix is ignored.
+    """
+    local = (addr or "").partition("@")[0].split("+", 1)[0].strip()
+    tokens = [t for t in re.split(r"[._\-]+", local) if t]
+    if len(tokens) < 2:
+        return None
+    if not all(_NAME_TOKEN.match(t) for t in tokens):
+        return None
+    if any(t.lower() in _GENERIC_LOCALPARTS for t in tokens):
+        return None
+    return " ".join(t.capitalize() for t in tokens)
+
+
+def event_key(tenant: str, note: MeetingNote) -> str:
+    """Canonical key for a meeting's event node. Keyed by the *meeting* (cleaned
+    title + scheduled slot) when the slot is known, so two note-pages of one
+    meeting collapse to one event while distinct occurrences (different slots)
+    stay separate. Falls back to the per-page key when no slot is present."""
+    if note.scheduled_at:
+        h = hashlib.sha256(
+            f"{(note.title or '').strip().lower()}|{note.scheduled_at}".encode("utf-8")
+        ).hexdigest()[:32]
+        return f"event:{tenant}:meeting:{h}"
+    return f"event:{tenant}:meetingnote:{note.page_id}"
+
+
 def extract_graph(
     notes: list[MeetingNote],
     *,
@@ -83,10 +131,12 @@ def extract_graph(
     crm_names: dict[str, str],
     name_to_domain: dict[str, str],
     own_domains: set[str],
+    name_by_email: dict[str, str] | None = None,
     free_mail_domains: set[str] | None = None,
     role_localparts: set[str] | None = None,
 ) -> Extraction:
     """Deterministic core of notes ingestion (see module docstring)."""
+    names = name_by_email or {}
     entities: dict[str, Entity] = {}
     edges: list[Edge] = []
     seen_edges: set[tuple[str, str, str]] = set()
@@ -104,53 +154,65 @@ def extract_graph(
             seen_edges.add(k)
             edges.append(Edge(source, target, rel, why))
 
-    def classify_participant(tenant: str, addr: str, name: str | None) -> tuple[str | None, str | None]:
-        """Register the entities an address implies (+ its `affiliated_with`
-        edge) and return (person_ck, company_ck). Notes have no correspondence
-        signal, so companies qualify via the CRM only."""
+    def classify_participant(
+        tenant: str, addr: str, name: str | None, why: str,
+    ) -> str | None:
+        """Register the entities an address implies and return the company
+        domain present (or None). A `person` is materialized only when we have a
+        real `name` (label = name, email → attribute); without a name the person
+        is dropped (no node, no `attended`, no `affiliated_with`). The company is
+        still asserted from a qualifying domain regardless of naming — attendance
+        is observed even when we can't name the attendee. Notes have no
+        correspondence signal, so companies qualify via the CRM only."""
         c = classify_address(
             addr, name, crm_domains=crm_domains, correspondent_domains=set(),
             own_domains=own_domains, crm_names=crm_names,
             free_mail_domains=free_mail_domains, role_localparts=role_localparts,
         )
-        person_ck = company_ck = None
-        if c.person:
-            person_ck = f"person::{tenant}::{c.person.email}"
-            add_entity(Entity(person_ck, "person", c.person.name or c.person.email))
+        company_ck = None
         if c.company:
             company_ck = f"company::{tenant}::{c.company.domain}"
             add_entity(Entity(company_ck, "company", c.company.label))
-        if person_ck and company_ck:
-            add_edge(person_ck, "affiliated_with", company_ck,
-                     why=f"{c.person.email} is at {c.company.domain}")
-        return person_ck, company_ck
+        if c.person and c.person.name:
+            person_ck = f"person::{c.person.email}"  # global identity (cross-tenant)
+            add_entity(Entity(
+                person_ck, "person", c.person.name,
+                attributes=[{"key": "email", "value": c.person.email,
+                             "data_type": "string", "source": "notes"}],
+            ))
+            add_edge(person_ck, "attended", event_ck, why=why)
+            if company_ck:
+                add_edge(person_ck, "affiliated_with", company_ck,
+                         why=f"{c.person.email} is at {c.company.domain}")
+        return c.company.domain if c.company else None
 
     for note in notes:
         tenant = note.tenant_id
-        event_ck = f"event:{tenant}:meetingnote:{note.page_id}"
+        event_ck = event_key(tenant, note)
         add_entity(Entity(
             event_ck, "event", note.title,
-            occurred_at=note.occurred_at or note.last_edited,
+            occurred_at=note.scheduled_at or note.occurred_at or note.last_edited,
             metadata={"event_type": "meeting", "page_id": note.page_id},
         ))
 
-        # Owner: resolved to an email upstream (firm directory). No email →
-        # dropped entirely (no name-slug node). Owner is a colleague → person.
-        if note.owner_email:
-            o_person, _ = classify_participant(tenant, note.owner_email, note.owner_name)
-            if o_person:
-                add_edge(o_person, "attended", event_ck, why="meeting owner")
+        # Owner: resolved to an email upstream + named from the firm row. No
+        # email → dropped (no name-slug node). Owner is a colleague → person.
+        if note.owner_email and note.owner_name:
+            classify_participant(tenant, note.owner_email, note.owner_name, "meeting owner")
 
-        # Attendees: each address classified; humans attend, role mailboxes
-        # contribute only their company. Track which company domains are present
-        # so the `about` edge can require a member of that org in the room.
+        # Attendees: resolve each email to a name (firm team / CRM directory);
+        # named → person + `attended`, unnamed → dropped. Track company domains
+        # present so the `about` edge can require a member of that org in the room.
         company_domains_present: set[str] = set()
         for addr in note.attendees:
-            person_ck, company_ck = classify_participant(tenant, addr, None)
-            if person_ck:
-                add_edge(person_ck, "attended", event_ck, why="meeting attendee")
-            if company_ck:
-                company_domains_present.add(addr.partition("@")[2].lower())
+            resolved = (
+                names.get(addr)
+                or (note.owner_name if addr == note.owner_email else None)
+                or name_from_email(addr)
+            )
+            domain = classify_participant(tenant, addr, resolved, "meeting attendee")
+            if domain:
+                company_domains_present.add(domain)
 
         # `about`: the meeting's named org, only when it resolves to a CRM
         # company AND a member of that company attended (same domain present).

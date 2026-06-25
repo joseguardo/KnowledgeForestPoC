@@ -15,8 +15,10 @@ interface IngestDocumentRequest {
   occurred_at?: string;
   metadata?: Record<string, unknown>;
   chunk_size?: number;
-  // Access class (security level) for the document, its chunks and the link edge.
+  // Access class for the document, its chunks and the link edge. Translated to
+  // acl[]; `principals` overrides with an explicit set (e.g. body participants).
   access_class?: string;
+  principals?: string[];
   // Optional namespace folded into the content hash so byte-identical content in
   // different scopes (e.g. two firms/tenants) does NOT collapse to one pointer.
   canonical_key_namespace?: string;
@@ -30,6 +32,13 @@ interface IngestDocumentRequest {
 }
 
 const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
+
+function principalsForClass(key?: string): string[] {
+  if (!key || key === "public") return [PUBLIC_CLASS_ID];
+  if (key.startsWith("firm:")) return [key.slice(5)];
+  if (key.startsWith("user:")) return [key.slice(5)];
+  return [];
+}
 
 async function resolveClassId(supabase: ReturnType<typeof createClient>, key?: string): Promise<string> {
   const { data } = await supabase.from("access_classes").select("id").eq("key", key || "public").maybeSingle();
@@ -149,6 +158,7 @@ Deno.serve(async (req: Request) => {
 
     const docClass = body.access_class || "public";
     const docClassId = await resolveClassId(supabase, docClass);
+    const docPrincipals = body.principals ?? principalsForClass(docClass);
     // Fail closed: a non-public class that doesn't resolve must NOT silently fall
     // back to public (that would leak private content). Reject instead.
     if (docClass !== "public" && docClassId === PUBLIC_CLASS_ID) {
@@ -167,6 +177,7 @@ Deno.serve(async (req: Request) => {
         p_metadata: { ...(body.metadata || {}), char_count: body.content.length, chunk_count: chunks.length },
         p_embedding: docEmbedding ? JSON.stringify(docEmbedding) : null,
         p_access_class: docClass,
+        p_acl: docPrincipals,
       }
     );
 
@@ -194,6 +205,7 @@ Deno.serve(async (req: Request) => {
         heading: c.heading,
         embedding: chunkEmbeddings[i] ? JSON.stringify(chunkEmbeddings[i]) : null,
         access_class_id: docClassId,
+        acl: docPrincipals,
         metadata: {},
       }));
 
@@ -241,6 +253,7 @@ Deno.serve(async (req: Request) => {
             payload: {},
             weight: 1.0,
             access_class_id: docClassId,
+            acl: docPrincipals,
           })
           .select("id, relationship_type, target_id")
           .single();

@@ -407,16 +407,25 @@ def _is_brandy_name(name: str | None) -> bool:
     return " " not in n and bool(re.search(r"\w\.\w{2,}", n) or re.search(r"\d", n))
 
 
+def _is_drop_sender(addr: str) -> bool:
+    """A sender role mailbox (info@, sales@, marketing@, newsletter@, …) — not
+    human 1:1 correspondence. Configurable via gmail_drop_sender_localparts."""
+    local = addr.split("@", 1)[0].lower()
+    drop = {p.strip().lower() for p in (settings.gmail_drop_sender_localparts or "").split(",") if p.strip()}
+    return local in drop
+
+
 def _is_noise_message(parsed: dict[str, Any]) -> bool:
     """True for non-human mail we don't ingest: newsletters / mailing lists,
-    marketing & product info, login/transactional, and other automated mail.
+    marketing & product info, login/transactional, meeting invitations, and other
+    automated mail.
 
     Detected from headers we already receive (List-Unsubscribe/List-Id,
-    Precedence: bulk|list|junk, Auto-Submitted), a no-reply/automated sender
-    address, or a brand/team sender display name (for marketing mail that carries
-    no machine headers). Meeting invitations (text/calendar) are intentionally
-    NOT filtered yet. A login/OTP mail from a custom domain with none of these
-    signals may still slip through."""
+    Precedence: bulk|list|junk, Auto-Submitted, a text/calendar part), a
+    no-reply/automated or role-mailbox sender address, or a brand/team sender
+    display name (for marketing mail that carries no machine headers). A plain
+    header-less mail from a real address (e.g. a recurring internal agenda) can
+    still slip through — that needs content/LLM signals, not headers."""
     if parsed.get("list_mail"):
         return True
     if parsed.get("is_calendar"):
@@ -430,7 +439,7 @@ def _is_noise_message(parsed: dict[str, Any]) -> bool:
     if not senders:
         return False
     addr, name = senders[0]
-    return _is_noise(addr) or _is_brandy_name(name)
+    return _is_noise(addr) or _is_drop_sender(addr) or _is_brandy_name(name)
 
 
 def messages_from_thread(

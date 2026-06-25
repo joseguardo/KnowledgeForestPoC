@@ -15,7 +15,8 @@ interface BatchItem {
   metadata?: Record<string, unknown>;
   occurred_at?: string;
   access_class?: string;
-  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string }[];
+  principals?: string[];
+  attributes?: { key: string; value: unknown; data_type?: string; sort_order?: number; source?: string; access_class?: string; principals?: string[] }[];
 }
 
 interface BatchRequest {
@@ -23,9 +24,17 @@ interface BatchRequest {
   source?: string;
   // Default access class for every item that doesn't set its own.
   access_class?: string;
+  principals?: string[];
 }
 
 const PUBLIC_CLASS_ID = "00000000-0000-0000-0000-000000000001";
+
+function principalsForClass(key?: string): string[] {
+  if (!key || key === "public") return [PUBLIC_CLASS_ID];
+  if (key.startsWith("firm:")) return [key.slice(5)];
+  if (key.startsWith("user:")) return [key.slice(5)];
+  return [];
+}
 
 async function classResolver(supabase: ReturnType<typeof createClient>) {
   const { data } = await supabase.from("access_classes").select("id,key");
@@ -111,6 +120,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const itemClass = item.access_class || body.access_class || "public";
+      const itemPrincipals = item.principals ?? body.principals ?? principalsForClass(itemClass);
 
       const { data: result, error: rpcError } = await supabase.rpc(
         "insert_pointer_with_dedup",
@@ -121,6 +131,7 @@ Deno.serve(async (req: Request) => {
           p_metadata: item.metadata || {},
           p_embedding: embeddings[i] ? JSON.stringify(embeddings[i]) : null,
           p_access_class: itemClass,
+          p_acl: itemPrincipals,
         }
       );
 
@@ -145,6 +156,7 @@ Deno.serve(async (req: Request) => {
           sort_order: attr.sort_order ?? j,
           source: attr.source || body.source || "batch",
           access_class_id: resolveClass(attr.access_class || itemClass),
+          acl: attr.principals ?? (attr.access_class ? principalsForClass(attr.access_class) : itemPrincipals),
           updated_at: new Date().toISOString(),
         }));
 

@@ -108,6 +108,15 @@ class GmailRequest(BaseModel):
     link: LinkSpec | None = None
 
 
+class CalendarRequest(BaseModel):
+    subject: str | None = None      # mailbox to impersonate; omit to sweep the firm
+    max_results: int | None = None  # falls back to settings.calendar_max_results
+    since_last: bool = False        # recurrent sync: use/advance per-mailbox cursors
+    tenant_id: str | None = None    # scope a run to one firm; omit to sweep all firms
+    access_class: str | None = None
+    link: LinkSpec | None = None
+
+
 class NotesRequest(BaseModel):
     tenant_id: str | None = None    # scope a run to one firm; omit to sweep all firms
     since_last: bool = False        # recurrent sync: use/advance the per-tenant cursor

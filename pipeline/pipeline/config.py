@@ -90,10 +90,29 @@ class Settings(BaseSettings):
         "careers,hr,billing,accounts,marketing,newsletter,news,events,booking,"
         "bookings,registration,invite,invites,deals,partnerships,partners,welcome"
     )
+    # Role mailboxes that, when they are the SENDER, mean the message is not human
+    # 1:1 correspondence (marketing/transactional) → drop it entirely. Narrower
+    # than gmail_role_localparts on purpose; comma-separated, matched on the local
+    # part, case-insensitive.
+    gmail_drop_sender_localparts: str = "info,sales,marketing,newsletter"
     # Drop threads whose only sender is a no-reply/alert address (keeps automated
     # newsletters out of the graph and off the embedding bill). Set False to
     # ingest everything regardless of sender.
     gmail_skip_noise_senders: bool = True
+
+    # Calendar connector. Reuses the Gmail service account + GMAIL_FIRMS config
+    # (same Workspace, same DWD client) — the SA must additionally hold the
+    # read-only Calendar scope below. Calendars are firm-wide (no per-user
+    # privacy): every event lands at the firm:{tenant_id} access class. Each
+    # mailbox's `primary` calendar is read; the same meeting on N attendees'
+    # calendars dedups to one event node by iCalUID.
+    calendar_scopes: str = "https://www.googleapis.com/auth/calendar.readonly"
+    # First-run lookback window (days). timeMin = now - this; no timeMax (upcoming
+    # events are ingested too). Incremental runs add updatedMin = cursor.
+    calendar_backfill_days: int = 30
+    # Per-calendar caps: events fetched per run, and events.list pagination bound.
+    calendar_max_results: int = 250
+    calendar_max_pages: int = 20
 
     # Notes connector (multi-tenant; reads meeting notes from a *source* Supabase
     # project over a direct Postgres connection using a least-privilege read-only

@@ -407,9 +407,9 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
     # role mailbox info@ → company, not a person; CRM name used; ana is a person.
     assert ("company", "company::T1::gohub.vc") in inserted
     assert inserted[("company", "company::T1::gohub.vc")]["label"] == "GoHub Ventures"
-    assert ("person", "person::T1::ana@gohub.vc") in inserted
-    assert ("person", "person::T1::me@kiboventures.com") in inserted
-    assert "person::T1::info@gohub.vc" not in keys
+    assert ("person", "person::ana@gohub.vc") in inserted
+    assert ("person", "person::me@kiboventures.com") in inserted
+    assert "person::info@gohub.vc" not in keys
     # exactly one event, subject-free, under the firm class.
     events = [ck for t, ck in inserted if t == "message"]
     assert len(events) == 1
@@ -418,24 +418,22 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
 
     links = {(c.kwargs["source_id"], c.kwargs["relationship_type"], c.kwargs["target_id"])
              for c in client.link_pointers.call_args_list}
-    assert ("person::T1::ana@gohub.vc", "affiliated_with", "company::T1::gohub.vc") in links
-    assert ("person::T1::me@kiboventures.com", "sent", events[0]) in links
-    assert (events[0], "received", "person::T1::ana@gohub.vc") in links
+    assert ("person::ana@gohub.vc", "affiliated_with", "company::T1::gohub.vc") in links
+    assert ("person::me@kiboventures.com", "sent", events[0]) in links
+    assert (events[0], "received", "person::ana@gohub.vc") in links
     # no to/cc/about edges — recipients are `received`, `about` is deferred
     assert not any(rel in ("to", "cc", "about") for _s, rel, _t in links)
 
-    # Private body: one document under the sentinel email_body class, linked to
-    # the message, tenant-namespaced; only the internal participant is a member.
+    # Private body: one document whose acl = the thread participants with accounts
+    # (here only the internal colleague), linked to the message, tenant-namespaced.
     dkw = client.ingest_document.call_args.kwargs
-    assert dkw["access_class"] == "email_body"
+    assert set(dkw["principals"]) == {"uid-me"}  # external ana/info not platform users
+    assert dkw.get("access_class") is None
     assert dkw["canonical_key_namespace"] == "T1"
     assert dkw["link"]["target_id"] == events[0]
     assert dkw["link"]["relationship_type"] == "email_content"
     assert "Body." in dkw["content"]
     assert dkw["metadata"]["thread_id"] == "TH"
-    mkw = add_members.call_args
-    assert mkw.args[1] == "T1" and mkw.args[2] == "TH"
-    assert set(mkw.args[3]) == {"uid-me"}  # external ana/info not platform users
 
 
 @pytest.mark.asyncio

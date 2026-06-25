@@ -50,8 +50,8 @@ def test_outbound_to_crm_domain_builds_person_company_and_edges():
     )
     ents = _by_key(g.entities)
 
-    me = "person::T1::me@kiboventures.com"
-    ana = "person::T1::ana@gohub.vc"
+    me = "person::me@kiboventures.com"
+    ana = "person::ana@gohub.vc"
     gohub = "company::T1::gohub.vc"
     assert {me, ana, gohub} <= set(ents)
     assert ents[gohub].type == "company" and ents[gohub].label == "GoHub Ventures"
@@ -77,7 +77,7 @@ def test_own_domain_sender_has_no_company():
     ents = _by_key(g.entities)
     assert "company::T1::kiboventures.com" not in ents
     assert "company::T1::gmail.com" not in ents          # free-mail recipient → no company
-    assert "person::T1::x@gmail.com" in ents
+    assert "person::x@gmail.com" in ents
 
 
 def test_non_crm_domain_needs_outbound_to_qualify():
@@ -92,7 +92,7 @@ def test_non_crm_domain_needs_outbound_to_qualify():
     g2 = extract_graph([inbound, outbound], crm_domains=set(), crm_names={}, own_domains=OWN)
     ents = _by_key(g2.entities)
     assert ents["company::T1::newvendor.io"].label == "Newvendor"
-    assert ("person::T1::pat@newvendor.io", "affiliated_with", "company::T1::newvendor.io") in _edge_set(g2.edges)
+    assert ("person::pat@newvendor.io", "affiliated_with", "company::T1::newvendor.io") in _edge_set(g2.edges)
 
 
 def test_role_mailbox_recipient_is_company_not_person():
@@ -101,7 +101,7 @@ def test_role_mailbox_recipient_is_company_not_person():
                       own_domains=OWN)
     ents = _by_key(g.entities)
     # role mailbox → a company entity, never a person; no `about` edge for now.
-    assert "person::T1::info@gohub.vc" not in ents
+    assert "person::info@gohub.vc" not in ents
     assert "company::T1::gohub.vc" in ents
     assert not any(e.rel == "received" for e in g.edges)
     assert not any(e.rel == "about" for e in g.edges)
@@ -151,7 +151,7 @@ def test_person_label_upgrades_to_real_name_across_messages():
         _msg(("me@kiboventures.com", "Me"), to=[("ana@gohub.vc", "Ana García")], mid="<m2>"),
     ]
     g = extract_graph(msgs, crm_domains=set(), crm_names={}, own_domains=OWN)
-    assert _by_key(g.entities)["person::T1::ana@gohub.vc"].label == "Ana García"
+    assert _by_key(g.entities)["person::ana@gohub.vc"].label == "Ana García"
 
 
 def test_person_label_is_not_downgraded_to_email():
@@ -160,7 +160,7 @@ def test_person_label_is_not_downgraded_to_email():
         _msg(("ana@gohub.vc", None), to=[("me@kiboventures.com", None)], mid="<m2>"),
     ]
     g = extract_graph(msgs, crm_domains=set(), crm_names={}, own_domains=OWN)
-    assert _by_key(g.entities)["person::T1::ana@gohub.vc"].label == "Ana García"
+    assert _by_key(g.entities)["person::ana@gohub.vc"].label == "Ana García"
 
 
 def test_correspondent_domains_are_outbound_recipients():

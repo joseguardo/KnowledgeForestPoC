@@ -107,6 +107,7 @@ from headers we already receive, deterministic, no LLM:
 | Marketing / product info | usually `List-Unsubscribe` (as above) |
 | Automated / login / transactional | `Precedence: bulk\|list\|junk`, or `Auto-Submitted:` ≠ `no` |
 | System / bounce | sender is no-reply / mailer-daemon (`_is_noise`, matched anywhere in the local-part — e.g. `comments-noreply@`) |
+| Role-mailbox sender | the **From** local-part is a role mailbox (`gmail_drop_sender_localparts`: info / sales / marketing / newsletter) — catches header-less marketing like `info@southsummit.io` |
 | Marketing with no machine headers | sender **display name** is a brand/team (`_is_brandy_name`: "team"/"equipo"/"newsletter"/…, or a single dotted/numeric token like "Fun.xyz") |
 | Meeting invitations | a `text/calendar` part (any method — REQUEST/REPLY/CANCEL) or Outlook calendar `Content-Class`; handled by the separate calendar path |
 
@@ -114,8 +115,10 @@ This is what stopped "El equipo de Miro" (`your@product.miro.com`) and
 "TheSequence" (`thesequence@substack.com`) from being ingested as people, and
 keeps calendar invites out of the email graph.
 
-**Residual limit:** a login/OTP mail from a custom domain carrying none of these
-headers can still slip through.
+**Residual limit:** a plain mail from a real (non-role) address carrying none of
+these signals can still slip through — e.g. a login/OTP from a custom domain, or a
+recurring internal agenda email ("Int.IA Daily" sent by a colleague, with no
+`text/calendar` part). Distinguishing those needs content/LLM signals, not headers.
 
 ### Person names (no email-string labels)
 
@@ -137,8 +140,16 @@ nodes (`_load_company_domains`). The write path reuses `insert_pointer`
 the Affinidad adapter — no bespoke email edge function.
 
 ### Config (`config.py`)
-`gmail_free_mail_domains`, `gmail_role_localparts` (comma-separated, sensible
-defaults).
+Comma-separated, sensible defaults:
+- `gmail_free_mail_domains` — webmail domains that get a person but never a company.
+- `gmail_role_localparts` — role mailboxes that, as a **recipient**, resolve to the
+  company (no person).
+- `gmail_drop_sender_localparts` — role mailboxes that, as the **sender**, drop the
+  whole message as marketing/transactional (narrower than `gmail_role_localparts`;
+  default `info,sales,marketing,newsletter`).
+- `gmail_skip_noise_senders` (bool, default `True`) — master switch for the
+  `_is_noise_message` drop logic; set `False` to ingest everything regardless of
+  sender.
 
 ### Tests
 `tests/test_adapters/test_email_entities.py`, `test_gmail_messages.py`,

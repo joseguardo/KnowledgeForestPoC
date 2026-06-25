@@ -45,7 +45,7 @@ def test_company_key_prefers_domain_else_id():
 
 
 def test_person_key_prefers_email_else_id():
-    assert person_key(TENANT, "A@Kibo.com", "uuid-2") == f"person::{TENANT}::a@kibo.com"
+    assert person_key(TENANT, "A@Kibo.com", "uuid-2") == f"person::a@kibo.com"
     assert person_key(TENANT, None, "uuid-2") == f"person::{TENANT}::id:uuid-2"
 
 
@@ -123,7 +123,7 @@ def test_to_entity_company_builds_key_and_attributes():
 def test_to_entity_person_uses_primary_email_and_email_list():
     row = {"id": "p1", "kind": "person", "full_name": "Ana Ruiz", "email": "ana@kibo.com", "title": "Partner"}
     ent = _to_entity(TENANT, row, {"p1": ["ana@kibo.com", "ana2@kibo.com"]})
-    assert ent.canonical_key == f"person::{TENANT}::ana@kibo.com"
+    assert ent.canonical_key == f"person::ana@kibo.com"
     assert ent.label == "Ana Ruiz"
     attrs = {k: v for (k, v, _dt) in ent.attributes}
     assert attrs["Title"] == "Partner"
@@ -258,7 +258,7 @@ async def test_fetch_entities_normalizes_and_closes():
     assert conn.closed is True
     keys = {e.canonical_key for e in ents}
     assert f"company::{TENANT}::acme.com" in keys
-    assert f"person::{TENANT}::ana@kibo.com" in keys
+    assert f"person::ana@kibo.com" in keys
 
 
 # ── orchestration: graph writes + access-class tiering ──────────────
@@ -383,11 +383,10 @@ async def test_ingest_crm_note_private_grants_author(monkeypatch):
     await ingest_mod._ingest_crm_note(
         AsyncMock(), client, note, f"firm:{TENANT}", {"a@k.com": "uid-a"}, resolve_link
     )
-    ensure_class.assert_awaited_once()
-    assert ensure_class.call_args.args[1] == f"affinidadnote:{TENANT}:n1"
+    # private note → acl = the author's uid (no class/grant); no firm access_class
     doc_kw = client.ingest_document.call_args.kwargs
-    assert doc_kw["access_class"] == f"affinidadnote:{TENANT}:n1"
-    ensure_user_grant.assert_awaited_once()
+    assert doc_kw["principals"] == ["uid-a"]
+    assert doc_kw.get("access_class") is None
 
 
 @pytest.mark.asyncio
@@ -412,14 +411,14 @@ async def test_ingest_crm_event_node_firm_wide_body_private_with_grants(monkeypa
     ev_kw = client.insert_pointer.call_args.kwargs
     assert ev_kw["type"] == "event"
     assert ev_kw["canonical_key"] == event_key(TENANT, "m1")
-    assert ev_kw["access_class"] == f"firm:{TENANT}"
+    assert ev_kw["access_class"] == f"firm:{TENANT}"  # event fact firm-wide → acl [tenant]
     roles = {c.kwargs["relationship_type"] for c in client.link_pointers.call_args_list}
     assert "attendee" in roles
-    assert ensure_class.call_args.args[1] == f"affinidadevent:{TENANT}:m1"
+    # participant-only body → acl = participant uids (no class/grant), no firm class
     doc_kw = client.ingest_document.call_args.kwargs
-    assert doc_kw["access_class"] == f"affinidadevent:{TENANT}:m1"
+    assert doc_kw["principals"] == ["uid-a"]
+    assert doc_kw.get("access_class") is None
     assert doc_kw["link"]["target_id"] == "ptr-1"  # body linked to the event node
-    ensure_user_grant.assert_awaited()  # internal participant granted
 
 
 @pytest.mark.asyncio
