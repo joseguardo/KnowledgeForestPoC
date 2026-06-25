@@ -6,3 +6,9 @@ dist
 .env*.local
 __pycache__
 .DS_Store
+
+# Secrets / credentials — never commit
+scripts/calendar/OAuth.json
+scripts/calendar/service-account.json
+scripts/calendar/token.pickle
+*.pickle

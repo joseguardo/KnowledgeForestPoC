@@ -1,0 +1,44 @@
+{
+  "_note": "Baseline captured 2026-06-22 AFTER reverting the limit changes (query-knowledge v4 defaults 15/30/10; search_hierarchy_aware entry cap back to LEAST(p_limit,10)). Re-run scripts/regression_check.sql and diff. Total counts drift with ongoing ingestion; the stable invariants are fund_rosters (22/22/7/4), edges_by_type.part_of (55), and naluat_status_divested.total (5).",
+  "counts": {
+    "edges_by_type": {
+      "cc": 3218,
+      "to": 5172,
+      "from": 1963,
+      "emailed": 313,
+      "part_of": 55,
+      "attended": 145,
+      "attendee": 124,
+      "works_at": 84,
+      "organizer": 20,
+      "regarding": 66,
+      "note_about": 1,
+      "attended_by": 855,
+      "email_content": 265,
+      "meeting_notes": 119
+    },
+    "pointers_by_type": {
+      "meta": 4,
+      "event": 3481,
+      "person": 344,
+      "company": 321,
+      "document": 385
+    }
+  },
+  "fund_rosters": {
+    "Fund II": 22,
+    "Fund IV": 4,
+    "Fund III": 22,
+    "Opportunity Fund": 7
+  },
+  "search_person": { "n": 1, "top": ["The Founders Corner"] },
+  "search_company_AI": {
+    "n": 10,
+    "top": ["iLoF - Intelligent Lab on Fiber", "kloutit", "BitMetrics", "Voi<3", "Xpdeep", "HOMLI", "Barbara IoT", "Ramblr", "Monumo", "Zymvol Biomodeling"]
+  },
+  "search_email_event": {
+    "n": 10,
+    "top": ["Email: ? -> jose", "Email: ? -> jose", "Email: MITO -> jaaz", "Email: mentorDay -> jose", "Email: maria -> jaaz", "Email · 2026-06-06", "Email · 2026-06-06", "Email · 2026-06-06", "Email · 2026-06-06", "Email · 2026-06-06"]
+  },
+  "naluat_status_divested": { "total": 5 }
+}
