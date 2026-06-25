@@ -32,15 +32,6 @@ function principalsForClass(key?: string): string[] {
   return [];
 }
 
-// Resolve access-class keys -> ids once per request (still stamped on attribute
-// rows during the transition; RLS uses acl).
-async function classResolver(supabase: ReturnType<typeof createClient>) {
-  const { data } = await supabase.from("access_classes").select("id,key");
-  const idByKey: Record<string, string> = {};
-  (data || []).forEach((c: { id: string; key: string }) => { idByKey[c.key] = c.id; });
-  return (key?: string) => idByKey[key || "public"] || PUBLIC_CLASS_ID;
-}
-
 async function getEmbedding(text: string): Promise<number[] | null> {
   const openaiKey = Deno.env.get("OPENAI_API_KEY");
   if (!openaiKey) return null;
@@ -96,7 +87,6 @@ Deno.serve(async (req: Request) => {
       : body.label;
     const embedding = await getEmbedding(embeddingText);
 
-    const resolveClass = await classResolver(supabase);
     const pointerClass = body.access_class || "public";
     const pointerPrincipals = body.principals ?? principalsForClass(pointerClass);
 
@@ -132,8 +122,6 @@ Deno.serve(async (req: Request) => {
         data_type: attr.data_type || "string",
         sort_order: attr.sort_order ?? i,
         source: attr.source || "api",
-        // Per-attribute class override, else the pointer's class.
-        access_class_id: resolveClass(attr.access_class || pointerClass),
         acl: attr.principals ?? (attr.access_class ? principalsForClass(attr.access_class) : pointerPrincipals),
         updated_at: new Date().toISOString(),
       }));

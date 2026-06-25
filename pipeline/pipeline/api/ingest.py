@@ -8,10 +8,6 @@ from typing import Optional
 from fastapi import APIRouter, Request, UploadFile, File, Form
 
 from pipeline.access import (
-    add_thread_members,
-    ensure_class,
-    ensure_tenant_grant,
-    ensure_user_grant,
     resolve_pointer_id,
     resolve_user_ids,
 )
@@ -302,10 +298,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
 
     for firm in firms:
         firm_class_key = f"firm:{firm.tenant_id}"
-        firm_class_id = await ensure_class(
-            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
-        )
-        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+        # firm:{tenant} → acl=[tenant] at the write boundary; no class/grant rows.
 
         crm_names = await _load_company_domains(http, firm.tenant_id)
         own_domains = {m.split("@", 1)[1].lower() for m in firm.mailboxes if "@" in m}
@@ -492,10 +485,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
 
     for firm in firms:
         firm_class_key = f"firm:{firm.tenant_id}"
-        firm_class_id = await ensure_class(
-            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
-        )
-        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+        # firm:{tenant} → acl=[tenant] at the write boundary; no class/grant rows.
 
         crm_names = await _load_company_domains(http, firm.tenant_id)
         own_domains = {m.split("@", 1)[1].lower() for m in firm.mailboxes if "@" in m}
@@ -656,10 +646,7 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
     for firm in firms:
         # Firm-wide class granted to the tenant (idempotent, one-time per firm).
         firm_class_key = f"firm:{firm.tenant_id}"
-        firm_class_id = await ensure_class(
-            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
-        )
-        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+        # firm:{tenant} → acl=[tenant] at the write boundary; no class/grant rows.
 
         cursor_key = f"notes:{firm.tenant_id}"
         since = await get_cursor(http, cursor_key) if body.since_last else None
@@ -1083,10 +1070,7 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
 
     for firm in firms:
         firm_class_key = f"firm:{firm.tenant_id}"
-        firm_class_id = await ensure_class(
-            http, firm_class_key, f"Firm {firm.tenant_id} shared knowledge"
-        )
-        await ensure_tenant_grant(http, firm_class_id, firm.tenant_id)
+        # firm:{tenant} → acl=[tenant] at the write boundary; no class/grant rows.
 
         # Always load entities (cheap) to resolve edges/notes/events to pointers,
         # even when this run only ingests downstream objects.

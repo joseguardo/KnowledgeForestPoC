@@ -4,7 +4,6 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from pipeline.access import ensure_class, ensure_user_grant
 from pipeline.client import EdgeFunctionClient
 from pipeline.config import settings
 
@@ -24,11 +23,9 @@ async def ingest_document(
     ctx = caller()
     http = get_http()
 
-    # Ensure the caller's private class exists and is granted to them BEFORE
-    # ingesting under it. Fail closed: never downgrade to public.
+    # `user:{uid}` is translated to acl=[uid] at the write boundary — readable
+    # only by the caller, invisible to everyone else. No class/grant rows needed.
     user_class = f"user:{ctx.uid}"
-    class_id = await ensure_class(http, user_class, f"Private knowledge for user {ctx.uid}")
-    await ensure_user_grant(http, class_id, ctx.uid)
 
     client = EdgeFunctionClient(
         http=http,

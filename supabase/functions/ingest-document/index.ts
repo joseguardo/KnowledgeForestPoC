@@ -40,11 +40,6 @@ function principalsForClass(key?: string): string[] {
   return [];
 }
 
-async function resolveClassId(supabase: ReturnType<typeof createClient>, key?: string): Promise<string> {
-  const { data } = await supabase.from("access_classes").select("id").eq("key", key || "public").maybeSingle();
-  return data?.id || PUBLIC_CLASS_ID;
-}
-
 async function sha256(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", data);
@@ -157,16 +152,9 @@ Deno.serve(async (req: Request) => {
     const chunkEmbeddings = embeddings.slice(1);
 
     const docClass = body.access_class || "public";
-    const docClassId = await resolveClassId(supabase, docClass);
+    // Visibility is the acl: principals override, else translated from the class.
+    // Fail-closed by construction — an unknown class yields [] (visible to no one).
     const docPrincipals = body.principals ?? principalsForClass(docClass);
-    // Fail closed: a non-public class that doesn't resolve must NOT silently fall
-    // back to public (that would leak private content). Reject instead.
-    if (docClass !== "public" && docClassId === PUBLIC_CLASS_ID) {
-      return new Response(
-        JSON.stringify({ error: `access_class '${docClass}' does not exist; refusing to fall back to public` }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
 
     const { data: result, error: rpcError } = await supabase.rpc(
       "insert_pointer_with_dedup",
@@ -204,7 +192,6 @@ Deno.serve(async (req: Request) => {
         content: c.content,
         heading: c.heading,
         embedding: chunkEmbeddings[i] ? JSON.stringify(chunkEmbeddings[i]) : null,
-        access_class_id: docClassId,
         acl: docPrincipals,
         metadata: {},
       }));
@@ -252,7 +239,6 @@ Deno.serve(async (req: Request) => {
             why: body.link.why || `Document "${body.title}" describes this entity`,
             payload: {},
             weight: 1.0,
-            access_class_id: docClassId,
             acl: docPrincipals,
           })
           .select("id, relationship_type, target_id")

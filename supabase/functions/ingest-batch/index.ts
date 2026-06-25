@@ -36,13 +36,6 @@ function principalsForClass(key?: string): string[] {
   return [];
 }
 
-async function classResolver(supabase: ReturnType<typeof createClient>) {
-  const { data } = await supabase.from("access_classes").select("id,key");
-  const idByKey: Record<string, string> = {};
-  (data || []).forEach((c: { id: string; key: string }) => { idByKey[c.key] = c.id; });
-  return (key?: string) => idByKey[key || "public"] || PUBLIC_CLASS_ID;
-}
-
 // One embedding API call for the whole batch instead of one per item.
 async function getEmbeddings(texts: string[]): Promise<(number[] | null)[]> {
   const openaiKey = Deno.env.get("OPENAI_API_KEY");
@@ -106,7 +99,6 @@ Deno.serve(async (req: Request) => {
       item.metadata ? `${item.label} ${JSON.stringify(item.metadata)}` : item.label ?? ""
     );
     const embeddings = await getEmbeddings(embeddingTexts);
-    const resolveClass = await classResolver(supabase);
 
     const results: Record<string, unknown>[] = [];
 
@@ -155,7 +147,6 @@ Deno.serve(async (req: Request) => {
           data_type: attr.data_type || "string",
           sort_order: attr.sort_order ?? j,
           source: attr.source || body.source || "batch",
-          access_class_id: resolveClass(attr.access_class || itemClass),
           acl: attr.principals ?? (attr.access_class ? principalsForClass(attr.access_class) : itemPrincipals),
           updated_at: new Date().toISOString(),
         }));
