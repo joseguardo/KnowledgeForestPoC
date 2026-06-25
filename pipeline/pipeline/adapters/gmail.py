@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timezone
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
@@ -56,6 +56,16 @@ class GmailFirm:
 
 
 @dataclass
+class Attachment:
+    """A real document attachment carried on an email (not inline images / invites
+    / signatures). `data` is the decoded bytes, ready for the document adapter."""
+
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass
 class EmailMessage:
     """One message within a thread — the atomic unit of the step-1 rebuild.
 
@@ -74,6 +84,33 @@ class EmailMessage:
     cc: list[tuple[str, str | None]]
     subject: str                            # private (used in a later body step)
     body: str                               # private (used in a later body step)
+    attachments: list[Attachment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EmailRejection:
+    """A message dropped as noise, recorded for debugging. `reason` is the matched
+    code (see `_noise_reason`). The subject + sender give enough context to judge a
+    wrong rejection without re-running."""
+
+    tenant_id: str
+    mailbox: str
+    message_id: str
+    thread_id: str
+    subject: str
+    sender: str                             # sender email (lowercased)
+    sender_name: str | None
+    occurred_at: str | None
+    reason: str
+
+
+@dataclass
+class MessageFetch:
+    """Result of flattening a thread / a mailbox: the kept messages plus the
+    messages dropped as noise (for the rejection log)."""
+
+    messages: list[EmailMessage] = field(default_factory=list)
+    rejections: list[EmailRejection] = field(default_factory=list)
 
 
 def load_firms(tenant_id: str | None = None) -> list[GmailFirm]:
@@ -180,27 +217,28 @@ class GmailAdapter:
         http: httpx.AsyncClient,
         query: str | None = None,
         max_results: int | None = None,
-    ) -> list[EmailMessage]:
+    ) -> MessageFetch:
         """Step-1 path: fetch threads and flatten to per-message records.
 
         Mints a DWD token, lists thread ids, fetches each thread's messages, and
-        emits one `EmailMessage` per message. Entity classification/direction are
-        applied later in the orchestration layer (CRM + own-domain context)."""
+        emits one `EmailMessage` per kept message plus an `EmailRejection` per
+        message dropped as noise. Entity classification/direction are applied
+        later in the orchestration layer (CRM + own-domain context)."""
         token = await _mint_token(firm.sa_info, subject, firm.scopes)
         headers = {"Authorization": f"Bearer {token}"}
         cap = max_results or settings.gmail_max_results
         thread_ids = await _list_thread_ids(http, headers, query, cap)
 
-        out: list[EmailMessage] = []
+        out = MessageFetch()
         for thread_id in thread_ids:
             try:
                 parsed = await _fetch_thread_parsed(http, headers, thread_id)
             except (AdapterError, ValidationError) as exc:
                 log.warning("skipping gmail thread %s for %s: %s", thread_id, subject, exc)
                 continue
-            out.extend(
-                messages_from_thread(parsed, tenant_id=firm.tenant_id, mailbox=subject)
-            )
+            fetched = messages_from_thread(parsed, tenant_id=firm.tenant_id, mailbox=subject)
+            out.messages.extend(fetched.messages)
+            out.rejections.extend(fetched.rejections)
         return out
 
 
@@ -415,31 +453,37 @@ def _is_drop_sender(addr: str) -> bool:
     return local in drop
 
 
-def _is_noise_message(parsed: dict[str, Any]) -> bool:
-    """True for non-human mail we don't ingest: newsletters / mailing lists,
-    marketing & product info, login/transactional, meeting invitations, and other
-    automated mail.
+def _noise_reason(parsed: dict[str, Any]) -> str | None:
+    """The reason code for dropping non-human mail, or None to keep it.
 
     Detected from headers we already receive (List-Unsubscribe/List-Id,
     Precedence: bulk|list|junk, Auto-Submitted, a text/calendar part), a
     no-reply/automated or role-mailbox sender address, or a brand/team sender
     display name (for marketing mail that carries no machine headers). A plain
     header-less mail from a real address (e.g. a recurring internal agenda) can
-    still slip through — that needs content/LLM signals, not headers."""
+    still slip through — that needs content/LLM signals, not headers.
+
+    Codes are stable identifiers for the rejection log; order = precedence."""
     if parsed.get("list_mail"):
-        return True
+        return "list_mail"
     if parsed.get("is_calendar"):
-        return True
+        return "calendar_invite"
     if parsed.get("precedence") in _BULK_PRECEDENCE:
-        return True
+        return "bulk_precedence"
     auto = parsed.get("auto_submitted", "")
     if auto and auto != "no":
-        return True
+        return "auto_submitted"
     senders = _addr_list(parsed.get("from"))
     if not senders:
-        return False
+        return None
     addr, name = senders[0]
-    return _is_noise(addr) or _is_drop_sender(addr) or _is_brandy_name(name)
+    if _is_noise(addr):
+        return "noreply_sender"
+    if _is_drop_sender(addr):
+        return "role_mailbox_sender"
+    if _is_brandy_name(name):
+        return "brandy_sender_name"
+    return None
 
 
 def messages_from_thread(
@@ -447,37 +491,54 @@ def messages_from_thread(
     *,
     tenant_id: str,
     mailbox: str,
-) -> list[EmailMessage]:
+) -> MessageFetch:
     """Flatten a thread's parsed messages into per-message records.
 
     Non-human messages (newsletters, automated/transactional, no-reply — see
-    `_is_noise_message`) are skipped entirely: no event, no entities. Pure: no
-    run context applied (direction/entities come later). `thread_id` is the
-    cross-mailbox-stable thread hash; messages with no References root fall back
-    to grouping by their own id.
+    `_noise_reason`) are skipped entirely (no event, no entities) and recorded as
+    `EmailRejection`s for the debug log. Pure: no run context applied
+    (direction/entities come later). `thread_id` is the cross-mailbox-stable
+    thread hash; messages with no References root fall back to grouping by their
+    own id.
     """
     root_id = _thread_root_id(parsed_msgs)
     thread_id = hashlib.sha256(root_id.encode("utf-8")).hexdigest()[:32] if root_id else ""
 
-    out: list[EmailMessage] = []
+    out = MessageFetch()
     for m in parsed_msgs:
-        if _is_noise_message(m):
-            continue
         senders = _addr_list(m.get("from"))
         sender = senders[0] if senders else ("", None)
         mid = (m.get("message_id") or "").strip() or _fallback_message_id(m)
-        out.append(
+        tid = thread_id or hashlib.sha256(mid.encode("utf-8")).hexdigest()[:32]
+        reason = _noise_reason(m)
+        if reason is not None:
+            out.rejections.append(
+                EmailRejection(
+                    tenant_id=tenant_id,
+                    mailbox=mailbox,
+                    message_id=mid,
+                    thread_id=tid,
+                    subject=m.get("subject") or "",
+                    sender=sender[0],
+                    sender_name=sender[1],
+                    occurred_at=_iso_or_none(m.get("occurred_at")),
+                    reason=reason,
+                )
+            )
+            continue
+        out.messages.append(
             EmailMessage(
                 tenant_id=tenant_id,
                 mailbox=mailbox,
                 message_id=mid,
-                thread_id=thread_id or hashlib.sha256(mid.encode("utf-8")).hexdigest()[:32],
+                thread_id=tid,
                 occurred_at=_iso_or_none(m.get("occurred_at")),
                 sender=sender,
                 to=_addr_list(m.get("to")),
                 cc=_addr_list(m.get("cc")),
                 subject=m.get("subject") or "",
                 body=m.get("body") or "",
+                attachments=m.get("attachments") or [],
             )
         )
     return out
@@ -512,7 +573,39 @@ def _parse_message(msg_bytes: bytes) -> dict[str, Any]:
         "precedence": str(msg.get("Precedence", "")).strip().lower(),
         "auto_submitted": str(msg.get("Auto-Submitted", "")).strip().lower(),
         "is_calendar": _has_calendar_part(msg),
+        "attachments": _extract_attachments(msg),
     }
+
+
+_SKIP_ATTACH_TYPES = {"text/calendar", "application/pkcs7-signature", "application/x-pkcs7-signature"}
+
+
+def _extract_attachments(msg: email.message.Message) -> list[Attachment]:
+    """Real document attachments only. Iterate the non-body parts and keep those
+    with a filename and an `attachment` disposition, dropping inline parts, images,
+    calendar invites, signatures, and anything over the upload-size cap."""
+    out: list[Attachment] = []
+    for part in msg.iter_attachments():
+        filename = part.get_filename()
+        if not filename:
+            continue
+        if (part.get_content_disposition() or "").lower() == "inline":
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        if ctype.startswith("image/") or ctype in _SKIP_ATTACH_TYPES:
+            continue
+        if filename.lower().endswith(".p7s"):
+            continue
+        try:
+            data = part.get_content()
+        except (KeyError, LookupError, ValueError):
+            data = part.get_payload(decode=True)
+        if isinstance(data, str):
+            data = data.encode("utf-8", "replace")
+        if not data or len(data) > settings.max_upload_bytes:
+            continue
+        out.append(Attachment(filename=filename, content_type=ctype, data=data))
+    return out
 
 
 def _has_calendar_part(msg: email.message.Message) -> bool:

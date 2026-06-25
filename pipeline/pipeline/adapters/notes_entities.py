@@ -33,6 +33,7 @@ from pipeline.adapters.email_entities import (
     Edge,
     Entity,
     Extraction,
+    NoteRejection,
     classify_address,
 )
 
@@ -139,6 +140,7 @@ def extract_graph(
     names = name_by_email or {}
     entities: dict[str, Entity] = {}
     edges: list[Edge] = []
+    rejections: list[NoteRejection] = []
     seen_edges: set[tuple[str, str, str]] = set()
 
     def add_entity(e: Entity) -> None:
@@ -155,15 +157,16 @@ def extract_graph(
             edges.append(Edge(source, target, rel, why))
 
     def classify_participant(
-        tenant: str, addr: str, name: str | None, why: str,
+        tenant: str, addr: str, name: str | None, why: str, note: MeetingNote,
     ) -> str | None:
         """Register the entities an address implies and return the company
         domain present (or None). A `person` is materialized only when we have a
         real `name` (label = name, email → attribute); without a name the person
-        is dropped (no node, no `attended`, no `affiliated_with`). The company is
-        still asserted from a qualifying domain regardless of naming — attendance
-        is observed even when we can't name the attendee. Notes have no
-        correspondence signal, so companies qualify via the CRM only."""
+        is dropped (no node, no `attended`, no `affiliated_with`) and recorded as
+        a NoteRejection. The company is still asserted from a qualifying domain
+        regardless of naming — attendance is observed even when we can't name the
+        attendee. Notes have no correspondence signal, so companies qualify via
+        the CRM only."""
         c = classify_address(
             addr, name, crm_domains=crm_domains, correspondent_domains=set(),
             own_domains=own_domains, crm_names=crm_names,
@@ -184,6 +187,14 @@ def extract_graph(
             if company_ck:
                 add_edge(person_ck, "affiliated_with", company_ck,
                          why=f"{c.person.email} is at {c.company.domain}")
+        elif c.person and not c.person.name:
+            # A human address we couldn't name → dropped (not a role-mailbox /
+            # noise classification, which leave c.person None). Log it.
+            rejections.append(NoteRejection(
+                tenant_id=tenant, page_id=note.page_id, title=note.title,
+                attendee=c.person.email, reason="unnamed_attendee",
+                occurred_at=note.occurred_at or note.last_edited,
+            ))
         return c.company.domain if c.company else None
 
     for note in notes:
@@ -196,9 +207,15 @@ def extract_graph(
         ))
 
         # Owner: resolved to an email upstream + named from the firm row. No
-        # email → dropped (no name-slug node). Owner is a colleague → person.
+        # email/name → dropped (no name-slug node), logged. Owner is a colleague.
         if note.owner_email and note.owner_name:
-            classify_participant(tenant, note.owner_email, note.owner_name, "meeting owner")
+            classify_participant(tenant, note.owner_email, note.owner_name, "meeting owner", note)
+        elif note.owner_email:
+            rejections.append(NoteRejection(
+                tenant_id=tenant, page_id=note.page_id, title=note.title,
+                attendee=note.owner_email.lower(), reason="unresolved_owner",
+                occurred_at=note.occurred_at or note.last_edited,
+            ))
 
         # Attendees: resolve each email to a name (firm team / CRM directory);
         # named → person + `attended`, unnamed → dropped. Track company domains
@@ -210,7 +227,7 @@ def extract_graph(
                 or (note.owner_name if addr == note.owner_email else None)
                 or name_from_email(addr)
             )
-            domain = classify_participant(tenant, addr, resolved, "meeting attendee")
+            domain = classify_participant(tenant, addr, resolved, "meeting attendee", note)
             if domain:
                 company_domains_present.add(domain)
 
@@ -222,4 +239,4 @@ def extract_graph(
             label = crm_names.get(about_domain, about_domain)
             add_edge(event_ck, "about", company_ck, why=f"meeting about {label}")
 
-    return Extraction(list(entities.values()), edges)
+    return Extraction(list(entities.values()), edges, rejections)

@@ -52,6 +52,16 @@ def test_txt_file():
     assert items[0].content == "Just some plain text content here."
 
 
+def test_docx_returns_placeholder_not_garbage():
+    # Binary Office formats aren't UTF-8 text; decoding the ZIP yields gibberish.
+    # Instead we record a clean placeholder node (so an attachment is still linked).
+    adapter = DocumentAdapter()
+    items = adapter.process_file("deck.docx", b"PK\x03\x04 binary zip junk")
+    assert len(items) == 1
+    assert items[0].label == "deck"
+    assert "not extracted" in items[0].content.lower()
+
+
 def test_empty_file_raises():
     adapter = DocumentAdapter()
     with pytest.raises(AdapterError, match="empty"):

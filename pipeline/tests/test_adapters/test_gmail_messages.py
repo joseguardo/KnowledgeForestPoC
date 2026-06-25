@@ -23,7 +23,11 @@ def _parse(*raws: str) -> list[dict]:
 
 
 def _flatten(*raws: str):
-    return messages_from_thread(_parse(*raws), tenant_id="T1", mailbox="me@acme.com")
+    return messages_from_thread(_parse(*raws), tenant_id="T1", mailbox="me@acme.com").messages
+
+
+def _reject(*raws: str):
+    return messages_from_thread(_parse(*raws), tenant_id="T1", mailbox="me@acme.com").rejections
 
 
 _HUMAN = dict(
@@ -43,7 +47,7 @@ def test_thread_yields_one_record_per_message():
         _raw("me@acme.com", "Alice <alice@x.com>", "Re: Deal", "Mon, 1 Jun 2026 12:00:00 +0000",
              "Reply.", "<r2@acme.com>", references="<root@x.com>", cc="Bob <bob@y.com>"),
     )
-    msgs = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com")
+    msgs = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com").messages
 
     assert len(msgs) == 2
     assert all(isinstance(m, EmailMessage) for m in msgs)
@@ -59,7 +63,7 @@ def test_record_captures_sender_and_recipients():
         _raw("me@acme.com", "Alice <alice@x.com>", "Re: Deal", "Mon, 1 Jun 2026 12:00:00 +0000",
              "Reply.", "<r2@acme.com>", cc="Bob <bob@y.com>"),
     )
-    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com")[0]
+    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com").messages[0]
     assert m.sender == ("me@acme.com", None)
     assert m.to == [("alice@x.com", "Alice")]
     assert m.cc == [("bob@y.com", "Bob")]
@@ -71,7 +75,7 @@ def test_addresses_are_lowercased():
         _raw("Alice <Alice@X.com>", "ME@Acme.com", "Hi", "Mon, 1 Jun 2026 10:00:00 +0000",
              "Body.", "<root@x.com>"),
     )
-    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com")[0]
+    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com").messages[0]
     assert m.sender == ("alice@x.com", "Alice")
     assert m.to == [("me@acme.com", None)]
 
@@ -81,8 +85,8 @@ def test_missing_message_id_gets_stable_fallback():
                "Body.", "")  # empty Message-ID
     p1 = _parse(raw)
     p2 = _parse(raw)
-    id1 = messages_from_thread(p1, tenant_id="T1", mailbox="me@acme.com")[0].message_id
-    id2 = messages_from_thread(p2, tenant_id="T1", mailbox="me@acme.com")[0].message_id
+    id1 = messages_from_thread(p1, tenant_id="T1", mailbox="me@acme.com").messages[0].message_id
+    id2 = messages_from_thread(p2, tenant_id="T1", mailbox="me@acme.com").messages[0].message_id
     assert id1 and id1 == id2  # deterministic, non-empty
 
 
@@ -165,6 +169,41 @@ def test_subject_and_body_are_retained_for_later_steps():
         _raw("Alice <alice@x.com>", "me@acme.com", "Q3 secret terms",
              "Mon, 1 Jun 2026 10:00:00 +0000", "The body.", "<root@x.com>"),
     )
-    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com")[0]
+    m = messages_from_thread(parsed, tenant_id="T1", mailbox="me@acme.com").messages[0]
     assert m.subject == "Q3 secret terms"
     assert "the body" in m.body.lower()
+
+
+# ── dropped messages are recorded as rejections (debug log) ──
+
+
+def test_rejection_carries_subject_sender_and_reason():
+    rej = _reject(_human(
+        subject="Big Sale!!",
+        sender="El equipo de Miro <your@product.miro.com>",
+    ))
+    assert len(rej) == 1
+    r = rej[0]
+    assert r.reason == "brandy_sender_name"
+    assert r.subject == "Big Sale!!"
+    assert r.sender == "your@product.miro.com"
+    assert r.tenant_id == "T1" and r.mailbox == "me@acme.com"
+    assert r.message_id  # non-empty, for the dedup key
+
+
+def test_rejection_reason_codes_per_signal():
+    cases = {
+        "list_mail": _human(extra_headers={"List-Unsubscribe": "<mailto:u@x.com>"}),
+        "bulk_precedence": _human(extra_headers={"Precedence": "bulk"}),
+        "auto_submitted": _human(extra_headers={"Auto-Submitted": "auto-generated"}),
+        "noreply_sender": _human(sender="Acme <no-reply@acme.com>"),
+        "role_mailbox_sender": _human(sender="South Summit <info@southsummit.io>"),
+        "brandy_sender_name": _human(sender="Fun.xyz <fun@swapped.com>"),
+    }
+    for expected, raw in cases.items():
+        rej = _reject(raw)
+        assert [r.reason for r in rej] == [expected], expected
+
+
+def test_kept_message_produces_no_rejection():
+    assert _reject(_human()) == []

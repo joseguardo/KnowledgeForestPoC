@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     # ingest everything regardless of sender.
     gmail_skip_noise_senders: bool = True
 
+    # Record why an input was dropped by the heuristics (Gmail noise, Notes
+    # unnamed attendees/owners) into the `ingestion_rejections` table for
+    # debugging. Best-effort write; set False to disable entirely.
+    log_ingestion_rejections: bool = True
+
     # Calendar connector. Reuses the Gmail service account + GMAIL_FIRMS config
     # (same Workspace, same DWD client) — the SA must additionally hold the
     # read-only Calendar scope below. Calendars are firm-wide (no per-user

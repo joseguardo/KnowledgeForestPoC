@@ -33,6 +33,7 @@ from pipeline.adapters.conversation import ConversationAdapter
 from pipeline.adapters.document import DocumentAdapter
 from pipeline.adapters.email_entities import _looks_like_email, extract_graph, message_key
 from pipeline.adapters.gmail import (
+    EmailRejection,
     GmailAdapter,
     _truncate_utf16,
     _utf16_len,
@@ -65,6 +66,7 @@ from pipeline.adapters.web import WebAdapter
 from pipeline.client import EdgeFunctionClient
 from pipeline.config import settings
 from pipeline.connector_state import get_cursor, set_cursor
+from pipeline.ingestion_rejections import log_rejections
 from pipeline.errors import (
     AdapterError,
     EdgeFunctionError,
@@ -331,6 +333,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
         # Phase A: collect all messages for the firm (so the correspondent set —
         # domains we've emailed — spans every mailbox), advancing cursors.
         messages = []
+        email_rejections: list[EmailRejection] = []
         cursor_marks: list[tuple[str, str]] = []
         for mailbox in mailboxes:
             if "@" in mailbox:
@@ -354,8 +357,12 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
             except (AdapterError, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
                 continue
-            messages.extend(msgs)
+            messages.extend(msgs.messages)
+            email_rejections.extend(msgs.rejections)
             cursor_marks.append((cursor_key, run_started))
+
+        # Record why messages were dropped by the noise heuristics (debug log).
+        await log_rejections(http, email=email_rejections)
 
         # Phase B: deterministic extraction, then write entities + edges.
         graph = extract_graph(
@@ -406,9 +413,9 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
 
-        # Phase C: private bodies. One document per newly-created message (skip
-        # `merged` — the second-mailbox copy / since_last overlap is already in),
-        # gated to the thread's participants via thread_membership.
+        # Phase C: private bodies + attachments. Per newly-created message (skip
+        # `merged` — the second-mailbox copy / since_last overlap is already in).
+        # Visibility (acl) = the thread participants who have accounts.
         msg_by_key = {}
         for m in messages:
             msg_by_key.setdefault(message_key(m.tenant_id, m.message_id), m)
@@ -416,41 +423,73 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
             pid = id_by_key.get(key)
             if not pid or key not in created_messages:
                 continue
+            member_uids = sorted({
+                uid for uid in (
+                    user_ids.get(a)
+                    for a in {m.sender[0], *(a for a, _ in m.to), *(a for a, _ in m.cc)}
+                ) if uid
+            })
+
+            # Body: one document linked to the message (skip if empty).
             content = f"{m.subject}\n\n{m.body}".strip() if m.subject else m.body.strip()
-            if not content:
-                continue
-            if _utf16_len(content) > settings.max_content_length:
-                content = _truncate_utf16(content, settings.max_content_length)
-            idx = len(results) + len(errors)
-            try:
-                member_uids = sorted({
-                    uid for uid in (
-                        user_ids.get(a)
-                        for a in {m.sender[0], *(a for a, _ in m.to), *(a for a, _ in m.cc)}
-                    ) if uid
-                })
-                # Body visibility = the thread participants who have accounts (acl),
-                # replacing the email_body class + thread_membership table.
-                await client.ingest_document(
-                    title=m.subject or "(no subject)",
-                    content=content,
-                    occurred_at=m.occurred_at,
-                    metadata={
-                        "tenant_id": m.tenant_id,
-                        "thread_id": m.thread_id,
-                        "mailbox": m.mailbox,
-                        "gmail_message_id": m.message_id,
-                    },
-                    principals=member_uids,
-                    canonical_key_namespace=m.tenant_id,
-                    link={
-                        "target_id": pid,
-                        "relationship_type": "email_content",
-                        "why": "Body of this email",
-                    },
-                )
-            except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
-                errors.append(_error_from_exc(idx, exc))
+            if content:
+                if _utf16_len(content) > settings.max_content_length:
+                    content = _truncate_utf16(content, settings.max_content_length)
+                idx = len(results) + len(errors)
+                try:
+                    await client.ingest_document(
+                        title=m.subject or "(no subject)",
+                        content=content,
+                        occurred_at=m.occurred_at,
+                        metadata={
+                            "tenant_id": m.tenant_id,
+                            "thread_id": m.thread_id,
+                            "mailbox": m.mailbox,
+                            "gmail_message_id": m.message_id,
+                        },
+                        principals=member_uids,
+                        canonical_key_namespace=m.tenant_id,
+                        link={
+                            "target_id": pid,
+                            "relationship_type": "email_content",
+                            "why": "Body of this email",
+                        },
+                    )
+                except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                    errors.append(_error_from_exc(idx, exc))
+
+            # Attachments: each real document → its own node (same acl), linked to
+            # the email. Content-hash dedup means the same file on two emails is one
+            # node with two `attachment` edges. A bad attachment is logged, not fatal.
+            for att in m.attachments:
+                idx = len(results) + len(errors)
+                try:
+                    item = DocumentAdapter().process_file(att.filename, att.data)[0]
+                    att_content = item.content or ""
+                    if _utf16_len(att_content) > settings.max_content_length:
+                        att_content = _truncate_utf16(att_content, settings.max_content_length)
+                    await client.ingest_document(
+                        title=att.filename,
+                        content=att_content,
+                        occurred_at=m.occurred_at,
+                        metadata={
+                            "tenant_id": m.tenant_id,
+                            "thread_id": m.thread_id,
+                            "mailbox": m.mailbox,
+                            "gmail_message_id": m.message_id,
+                            "attachment_filename": att.filename,
+                            "content_type": att.content_type,
+                        },
+                        principals=member_uids,
+                        canonical_key_namespace=m.tenant_id,
+                        link={
+                            "target_id": pid,
+                            "relationship_type": "attachment",
+                            "why": "Attached to this email",
+                        },
+                    )
+                except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                    errors.append(_error_from_exc(idx, exc))
 
         if body.since_last:
             for cursor_key, mark in cursor_marks:
@@ -686,6 +725,9 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
             own_domains=fetched.own_domains,
             name_by_email=name_by_email,
         )
+
+        # Record attendees/owners dropped for lacking a name (debug log).
+        await log_rejections(http, notes=graph.rejections)
 
         # Phase B: deterministic extraction → entities, then edges (mirror Gmail).
         id_by_key: dict[str, str] = {}

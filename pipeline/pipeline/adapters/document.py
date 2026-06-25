@@ -12,6 +12,11 @@ from pipeline.errors import AdapterError, ValidationError
 from pipeline.models import DocumentRequest, LinkSpec, NormalizedItem
 
 
+# Binary Office formats we can't yet parse to text — recorded as placeholder nodes
+# rather than UTF-8-decoded into gibberish.
+_BINARY_DOC_EXTS = {".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
+
+
 class DocumentAdapter:
     def process_text(self, request: DocumentRequest) -> list[NormalizedItem]:
         if not request.content:
@@ -52,6 +57,12 @@ class DocumentAdapter:
         elif ext in (".md", ".txt", ".markdown"):
             content = data.decode("utf-8", errors="replace")
             title = _title_from_markdown(content) or Path(filename).stem
+        elif ext in _BINARY_DOC_EXTS:
+            # Binary Office formats: decoding as UTF-8 yields gibberish and no
+            # parser is wired yet. Record a clean placeholder so the document is
+            # still a real (linkable) node; real extraction is a later step.
+            title = Path(filename).stem
+            content = f"[{filename}] — binary document, text not extracted"
         else:
             # Treat unknown extensions as plain text
             content = data.decode("utf-8", errors="replace")

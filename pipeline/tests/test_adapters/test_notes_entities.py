@@ -256,6 +256,41 @@ def test_attendee_dropped_when_email_not_a_confident_name():
     assert _edges(g.edges, "attended") == set()
 
 
+# ── dropped participants are recorded as rejections (debug log) ─────
+
+
+def test_unnamed_attendee_recorded_as_rejection():
+    g = _graph(
+        _note(owner_email=None, attendees=["claudiagarcia@adimpulsa.es"]),
+        names={},
+    )
+    assert len(g.rejections) == 1
+    r = g.rejections[0]
+    assert r.reason == "unnamed_attendee"
+    assert r.attendee == "claudiagarcia@adimpulsa.es"
+    assert r.page_id == "pg-1"
+    assert r.title == "Ext. Call Poseidon"
+    assert r.tenant_id == TENANT
+
+
+def test_unresolved_owner_recorded_as_rejection():
+    g = _graph(_note(owner_email="ghost@kiboventures.com", owner_name=None))
+    assert [(r.reason, r.attendee) for r in g.rejections] == [
+        ("unresolved_owner", "ghost@kiboventures.com"),
+    ]
+
+
+def test_named_participants_produce_no_rejections():
+    g = _graph(_note(attendees=["lp@poseidon.vc"]))  # owner + attendee both named
+    assert g.rejections == []
+
+
+def test_role_mailbox_attendee_is_not_a_rejection():
+    # info@ resolves to a company, not a dropped person → no rejection noise.
+    g = _graph(_note(owner_email=None, attendees=["info@poseidon.vc"]), names={})
+    assert g.rejections == []
+
+
 def test_no_person_is_ever_labelled_with_an_email():
     g = _graph(_note(owner_email="gp@kiboventures.com", attendees=["lp@poseidon.vc", "x@nope.com"]))
     for e in g.entities:

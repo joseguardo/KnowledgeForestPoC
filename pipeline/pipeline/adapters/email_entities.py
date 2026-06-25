@@ -143,6 +143,24 @@ class Edge:
 class Extraction:
     entities: list[Entity]
     edges: list[Edge]
+    # Inputs deterministically dropped during extraction, for the rejection log.
+    # Populated by the Notes path (unnamed attendee / unresolved owner); Gmail
+    # records its drops in the adapter (`EmailRejection`), not here.
+    rejections: list[NoteRejection] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class NoteRejection:
+    """A meeting participant dropped during notes extraction (no name → no person).
+    `ref` is the meeting's page_id; `dedup_key` ('{page_id}:{email}') keys the
+    upsert into the rejection log."""
+
+    tenant_id: str
+    page_id: str
+    title: str
+    attendee: str                          # the dropped address (lowercased)
+    reason: str                            # unnamed_attendee | unresolved_owner
+    occurred_at: str | None = None
 
 
 def _domain(email: str) -> str:

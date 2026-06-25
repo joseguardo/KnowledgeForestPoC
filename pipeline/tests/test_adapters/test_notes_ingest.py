@@ -90,6 +90,9 @@ def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None):
         ingest_mod, "_load_person_names", AsyncMock(return_value=person_names or {})
     )
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value=user_ids))
+    # Rejection logging is a best-effort PostgREST write; stub it so the endpoint
+    # doesn't hit the network, and so tests can assert what got logged.
+    monkeypatch.setattr(ingest_mod, "log_rejections", AsyncMock(return_value=0))
 
     async def fake_insert(**kw):
         return {"status": "created", "pointer_id": kw["canonical_key"]}
@@ -227,3 +230,25 @@ async def test_ingest_notes_drops_attendee_with_no_resolvable_name(async_client,
 
     persons = [c for c in client.insert_pointer.call_args_list if c.kwargs["type"] == "person"]
     assert persons == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_notes_logs_dropped_attendee_as_rejection(async_client, monkeypatch):
+    from pipeline.api import ingest as ingest_mod
+
+    _wire(
+        monkeypatch,
+        notes=[_note(owner_email=None, attendees=["mystery@unknown.com"])],
+        user_ids={},
+        person_names={},
+    )
+
+    resp = await async_client.post("/api/v1/ingest/notes", json={})
+    assert resp.status_code == 200, resp.text
+
+    ingest_mod.log_rejections.assert_awaited_once()
+    _, kwargs = ingest_mod.log_rejections.call_args
+    rejs = kwargs["notes"]
+    assert [(r.reason, r.attendee) for r in rejs] == [
+        ("unnamed_attendee", "mystery@unknown.com"),
+    ]

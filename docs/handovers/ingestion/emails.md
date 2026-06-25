@@ -91,6 +91,20 @@ sender/recipient copies and `since_last` overlaps never re-embed. Semantic
 "email about XY" runs over the document/chunks (the message-node embedding is
 label-only). Content is UTF-16-truncated to `max_content_length`.
 
+### Attachments
+
+Real document attachments are ingested as their own `document` nodes, linked
+`document --attachment--> message`, with the **same visibility as the body**
+(`principals` = the thread members with accounts). They ride the already-fetched
+raw RFC822, so no extra Gmail calls. `_extract_attachments` (gmail.py) keeps only
+parts with a filename and `attachment` disposition, dropping inline images,
+`image/*`, `text/calendar` invites, `*.p7s` signatures, and anything over
+`max_upload_bytes`. Each attachment goes through `DocumentAdapter.process_file`
+(real text for PDF/txt/md/eml; Office `.docx/.pptx/.xlsx` get a placeholder node
+until parsers are added). Same created-only gating + content-hash dedup as bodies,
+so the same file on two emails is one node with two `attachment` edges, and a
+failed attachment is logged, not fatal.
+
 > Known wart: re-ingesting emits `link-pointers` 409s ("edge already exists") for
 > the `sent`/`received` edges — harmless (no data growth), but noisy; fixable by
 > making `link-pointers` upsert-ignore like `ingest-email` does.

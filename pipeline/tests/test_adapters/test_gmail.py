@@ -9,6 +9,7 @@ import pytest
 from pipeline.adapters import gmail as gmail_mod
 from pipeline.adapters.gmail import (
     GmailAdapter,
+    MessageFetch,
     _decode_sa_key,
     _is_noise,
     _list_thread_ids,
@@ -370,7 +371,7 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
     ]
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
-        return msgs
+        return MessageFetch(messages=msgs)
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     # CRM knows gohub.vc with a real name.
@@ -451,7 +452,7 @@ async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client
     )]
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
-        return msgs
+        return MessageFetch(messages=msgs)
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
@@ -475,6 +476,61 @@ async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client
 
 
 @pytest.mark.asyncio
+async def test_ingest_gmail_ingests_and_links_attachments(async_client, monkeypatch):
+    """A real document attachment → its own document node, participant-private
+    (acl = thread members with accounts), linked to the message via `attachment`."""
+    from pipeline.adapters.gmail import Attachment, EmailMessage
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.main import app
+
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["me@kiboventures.com"]}]),
+    )
+    msgs = [EmailMessage(
+        tenant_id="T1", mailbox="me@kiboventures.com", message_id="<a@x>", thread_id="TH",
+        occurred_at="2026-06-01T10:00:00+00:00", sender=("me@kiboventures.com", "Me"),
+        to=[("jose@kiboventures.com", "Jose")], cc=[], subject="Deck", body="See attached.",
+        attachments=[Attachment(filename="notes.txt", content_type="text/plain", data=b"Deal terms inside.")],
+    )]
+
+    async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
+        return MessageFetch(messages=msgs)
+
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ingest_mod, "resolve_user_ids",
+        AsyncMock(return_value={"me@kiboventures.com": "uid-me", "jose@kiboventures.com": "uid-jose"}),
+    )
+
+    async def fake_insert(**kw):
+        return {"status": "created", "pointer_id": kw["canonical_key"]}
+
+    client = AsyncMock()
+    client.insert_pointer = AsyncMock(side_effect=fake_insert)
+    client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
+    app.state.client = client
+
+    resp = await async_client.post("/api/v1/ingest/gmail", json={})
+    assert resp.status_code == 200, resp.text
+
+    att = [c.kwargs for c in client.ingest_document.call_args_list
+           if (c.kwargs.get("link") or {}).get("relationship_type") == "attachment"]
+    assert len(att) == 1
+    a = att[0]
+    assert a["title"] == "notes.txt"
+    assert "Deal terms inside." in a["content"]
+    assert set(a["principals"]) == {"uid-me", "uid-jose"}
+    assert a["canonical_key_namespace"] == "T1"
+    assert a["link"]["target_id"].startswith("message:T1:gmail:")
+    assert a["metadata"]["attachment_filename"] == "notes.txt"
+    # the body is still ingested too
+    assert any((c.kwargs.get("link") or {}).get("relationship_type") == "email_content"
+               for c in client.ingest_document.call_args_list)
+
+
+@pytest.mark.asyncio
 async def test_ingest_gmail_messages_scopes_to_subject(async_client, monkeypatch):
     """`subject` restricts the step-1 run to that one mailbox, skipping discovery."""
     from pipeline.api import ingest as ingest_mod
@@ -490,7 +546,7 @@ async def test_ingest_gmail_messages_scopes_to_subject(async_client, monkeypatch
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
         fetched.append(subject)
-        return []
+        return MessageFetch()
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
@@ -531,7 +587,7 @@ async def test_ingest_gmail_manual_pull_defaults_lookback(async_client, monkeypa
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
         captured["query"] = query
-        return []
+        return MessageFetch()
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
@@ -581,7 +637,7 @@ async def test_ingest_gmail_domain_discovery_carves_out_explicit(async_client, m
 
     async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
         fetched.append((firm.tenant_id, subject))
-        return []
+        return MessageFetch()
 
     monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
     monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
