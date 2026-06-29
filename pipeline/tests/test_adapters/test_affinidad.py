@@ -61,6 +61,22 @@ def test_opportunity_key_is_id_scoped():
     assert opportunity_key("baa", "o1") == "opportunity::baa::id:o1"
 
 
+def test_opportunity_tenancy_routes_by_list():
+    from pipeline.adapters.affinidad import opportunity_tenancy
+    KIBO = "ca61f0e5-563e-5894-954f-38f5a9e0eabc"
+    firm = AffinidadFirm(tenant_id=KIBO, source_dsn=DSN)
+    # Nzyme lists → Nzyme
+    assert opportunity_tenancy(firm, {"Nzyme Dealflow"}) == (TENANT, [TENANT])
+    assert opportunity_tenancy(firm, {"LP Funnel"}) == (TENANT, [TENANT])
+    # listless opportunity defaults to Nzyme (their pipeline)
+    assert opportunity_tenancy(firm, set()) == (TENANT, [TENANT])
+    # a Kibo-list opportunity → Kibo (no longer forced to Nzyme)
+    assert opportunity_tenancy(firm, {"Kibo Dealflow"}) == (KIBO, [KIBO])
+    # in both → shared, key primary stays Nzyme
+    primary, firms = opportunity_tenancy(firm, {"Kibo Dealflow", "Nzyme Dealflow"})
+    assert primary == TENANT and set(firms) == {KIBO, TENANT}
+
+
 # ── config parsing ──────────────────────────────────────────────────
 
 
@@ -430,7 +446,7 @@ async def test_ingest_crm_note_org_is_firm_wide_and_links(monkeypatch):
     ensure_class.assert_not_called()
     lk = client.link_pointers.call_args.kwargs
     assert lk["source_id"] == "doc-1" and lk["target_id"] == "ptr-c1"
-    assert lk["relationship_type"] == "note_about"
+    assert lk["relationship_type"] == "content_of"
 
 
 @pytest.mark.asyncio
@@ -487,7 +503,7 @@ async def test_ingest_crm_event_node_firm_wide_body_private_with_grants(monkeypa
     assert doc_kw["principals"] == ["uid-a"]
     assert doc_kw.get("access_class") is None
     assert doc_kw["link"]["target_id"] == "ptr-1"
-    assert doc_kw["link"]["relationship_type"] == "communication_content"
+    assert doc_kw["link"]["relationship_type"] == "content_of"
 
 
 @pytest.mark.asyncio

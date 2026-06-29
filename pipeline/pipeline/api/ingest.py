@@ -455,7 +455,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
                         canonical_key_namespace=m.tenant_id,
                         link={
                             "target_id": pid,
-                            "relationship_type": "communication_content",
+                            "relationship_type": "content_of",
                             "why": "Body of this email",
                         },
                     )
@@ -1013,7 +1013,7 @@ def derive_company_firms(
             if me.kind != "company" or me.entity_id not in company_firms:
                 continue
             if other.kind == "opportunity":
-                company_firms[me.entity_id].add(other.tenant_id)
+                company_firms[me.entity_id].update(other.acl_firms or [other.tenant_id])
             elif other.kind == "person":
                 company_firms[me.entity_id].update(resolve_tenants(other.email or ""))
     return company_firms
@@ -1028,7 +1028,7 @@ async def _ingest_crm_note(
     resolve_link,
 ) -> dict:
     """One note → a document, firm-wide unless private (then a per-note class
-    ensured + granted to the author BEFORE ingest), plus note_about edges to each
+    ensured + granted to the author BEFORE ingest), plus content_of edges to each
     linked entity that resolves to a pointer."""
     body_access_class: str | None = None
     principals: list[str] | None = None
@@ -1060,7 +1060,7 @@ async def _ingest_crm_note(
                 await client.link_pointers(
                     source_id=doc_id,
                     target_id=tgt,
-                    relationship_type="note_about",
+                    relationship_type="content_of",
                     why="Note about this entity",
                 )
     return doc
@@ -1117,7 +1117,7 @@ async def _ingest_crm_event(
             if uid:
                 body_principals.append(uid)
         link = (
-            {"target_id": comm_id, "relationship_type": "communication_content",
+            {"target_id": comm_id, "relationship_type": "content_of",
              "why": f"Body of this {ev.type}"}
             if comm_id else None
         )
@@ -1269,7 +1269,11 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
             if tenants:
                 person_tenants.setdefault(eid, set()).update(tenants)
         def _affiliated_firms(ent: CrmEntity) -> list[str]:
-            return _company_acl(ent.entity_id) if ent.kind == "company" else [ent.tenant_id]
+            if ent.kind == "company":
+                return _company_acl(ent.entity_id)
+            if ent.kind == "opportunity":
+                return ent.acl_firms or [ent.tenant_id]
+            return [ent.tenant_id]
         for e in entities:
             if e.kind == "person":
                 person_tenants.setdefault(e.entity_id, set())
@@ -1301,13 +1305,19 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
                     out.update(_person_acl(eid))
                 elif ent.kind == "company":
                     out.update(_company_acl(eid))
+                elif ent.kind == "opportunity":
+                    out.update(ent.acl_firms or [ent.tenant_id])
                 else:
                     out.add(ent.tenant_id)
             return sorted(out or {firm.tenant_id})
 
         def _entity_principals(ent: CrmEntity) -> list[str]:
-            # company → involvement-derived; opportunity → its (Nzyme) tenant.
-            return _company_acl(ent.entity_id) if ent.kind == "company" else [ent.tenant_id]
+            # company → involvement-derived; opportunity → its list-derived firm(s).
+            if ent.kind == "company":
+                return _company_acl(ent.entity_id)
+            if ent.kind == "opportunity":
+                return ent.acl_firms or [ent.tenant_id]
+            return [ent.tenant_id]
 
         async def _do_company_opp(ent):
             resp = await _ingest_crm_entity(client, ent, principals=_entity_principals(ent))

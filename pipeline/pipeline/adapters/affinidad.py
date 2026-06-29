@@ -26,27 +26,33 @@ from pipeline.errors import AdapterError, ValidationError
 # Connection seam: tests inject a fake connect() returning a stub connection.
 ConnectFn = Callable[[str], Awaitable[Any]]
 
-# Affinidad holds BOTH firms' pipelines in one CRM: companies are Kibo's
-# dealflow, opportunities (dealflow + LP funnel) are Nzyme's. So an entity's
-# tenant routes by kind — company/person default to the firm (Kibo), opportunity
-# to Nzyme. (Mirrors mcp_server.tenant_map.NZYME_TENANT; kept local to avoid
-# importing the MCP package here. Revisit if a company ever joins an Nzyme list.)
+# Affinidad holds BOTH firms' pipelines in one CRM. An entity's firm is derived
+# from involvement, not hardcoded by kind: companies route by dealflow-list
+# membership + the opportunities that reference them (see derive_company_firms in
+# api/ingest.py), and opportunities route by their CRM list (see
+# opportunity_tenancy). Persons are global; companies/persons default to the firm
+# (Kibo). (NZYME_TENANT mirrors mcp_server.tenant_map; kept local to avoid
+# importing the MCP package here.)
 NZYME_TENANT = "baa52eca-4c88-4861-9d45-720e743febb4"
 
 
-def _entity_tenant(firm: "AffinidadFirm", kind: str | None) -> str:
-    return NZYME_TENANT if kind == "opportunity" else firm.tenant_id
-
-
-# CRM lists whose entries belong to Nzyme's pipeline. A company's firm(s) are
-# derived from involvement (its dealflow-list membership + the opportunities that
-# reference it), not just its kind — see `_company_acl` in api/ingest.py — so this
-# maps a list name to the firm that owns it.
+# CRM lists whose entries belong to Nzyme's pipeline; maps a list name to its firm.
 _NZYME_LIST_NAMES = {"nzyme dealflow", "lp funnel"}
 
 
 def list_tenant(firm: "AffinidadFirm", list_name: str | None) -> str:
     return NZYME_TENANT if (list_name or "").strip().lower() in _NZYME_LIST_NAMES else firm.tenant_id
+
+
+def opportunity_tenancy(firm: "AffinidadFirm", list_names) -> tuple[str, list[str]]:
+    """An opportunity's (primary_tenant_for_key, sorted_acl_firms), derived from the
+    CRM list(s) it belongs to rather than hardcoded to Nzyme by kind. Opportunities
+    are Nzyme's pipeline, so a listless one defaults to Nzyme; the canonical_key's
+    primary tenant is Nzyme whenever Nzyme is involved (stable keys), else the lone
+    other firm."""
+    firms = {list_tenant(firm, ln) for ln in list_names} or {NZYME_TENANT}
+    primary = NZYME_TENANT if NZYME_TENANT in firms else sorted(firms)[0]
+    return primary, sorted(firms)
 
 
 # ── Per-firm connector config ───────────────────────────────────────
@@ -121,6 +127,8 @@ class CrmEntity:
     metadata: dict[str, Any]
     occurred_at: str | None  # always None — entities are nouns, not events
     email: str | None = None  # persons only: primary email, for granting private bodies
+    acl_firms: list[str] | None = None  # opportunities: full firm acl, derived from
+    # the CRM list(s) they belong to (the canonical_key uses the primary firm)
 
 
 @dataclass
@@ -452,12 +460,31 @@ class AffinidadAdapter:
                 "sector, status, location, phone, title, linkedin_url, owner_email, affinity_id "
                 "FROM entities"
             )]
+            # CRM list membership routes an opportunity's firm (key + acl) instead
+            # of hardcoding Nzyme by kind.
+            list_rows = [dict(r) for r in await conn.fetch(
+                "SELECT e.company_id AS entity_id, l.name AS list_name "
+                "FROM crm_list_entries e JOIN crm_lists l ON l.id = e.list_id"
+            )]
         except Exception as exc:
             raise AdapterError(f"Affinidad entities query failed: {exc}")
         finally:
             await _close(conn)
         emails = emails_by_entity(email_rows)
-        return [_to_entity(_entity_tenant(firm, r.get("kind")), r, emails) for r in rows]
+        lists_by_entity: dict[str, set[str]] = {}
+        for lr in list_rows:
+            lists_by_entity.setdefault(str(lr["entity_id"]), set()).add(str(lr["list_name"]))
+
+        out: list[CrmEntity] = []
+        for r in rows:
+            if r.get("kind") == "opportunity":
+                primary, firms = opportunity_tenancy(firm, lists_by_entity.get(str(r["id"]), set()))
+                ent = _to_entity(primary, r, emails)
+                ent.acl_firms = firms
+            else:
+                ent = _to_entity(firm.tenant_id, r, emails)
+            out.append(ent)
+        return out
 
     async def fetch_edges(
         self, firm: AffinidadFirm, connect: ConnectFn = _default_connect
