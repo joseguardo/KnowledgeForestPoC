@@ -240,6 +240,7 @@ def test_to_deal_namespaces_attributes_per_list():
         field_defs=field_defs,
     )
     assert deal.entity_id == "c1"
+    assert deal.list_name == "Dealflow"
     attrs = {k: (v, dt) for (k, v, dt) in deal.attributes}
     assert attrs["Dealflow:Stage"] == ("Diligence", "string")
     # owners is a JSON array — must use the valid enum value "json", not "array"
@@ -360,12 +361,53 @@ async def test_apply_deal_attributes_upserts_on_company_pointer():
         entity_id="c1", list_name="Dealflow", stage_name="Diligence",
         owner_emails=["a@k.com"], field_values={}, field_defs=[],
     )
-    await ingest_mod._apply_deal_attributes(client, deal, {"c1": ent})
+    await ingest_mod._apply_deal_attributes(client, deal, {"c1": ent}, [TENANT])
     kw = client.insert_pointer.call_args.kwargs
     assert kw["type"] == "company"
     assert kw["canonical_key"] == f"company::{TENANT}::acme.com"
+    assert kw["principals"] == [TENANT]  # attrs inherit the entity's involvement acl
     keys = {a["key"] for a in kw["attributes"]}
     assert "Dealflow:Stage" in keys and "Dealflow:Owners" in keys
+
+
+def test_derive_company_firms_routes_by_involvement(monkeypatch):
+    # company firm(s) come from involvement, not kind: Kibo-dealflow membership,
+    # opportunities (Nzyme) that reference the company, and affiliated people's own
+    # firm. TENANT here is the Nzyme id; the firm (Kibo) is a distinct tenant.
+    monkeypatch.setattr(settings, "mcp_tenant_firms", None)  # baked-in tenant_map
+    KIBO = "ca61f0e5-563e-5894-954f-38f5a9e0eabc"
+    firm = AffinidadFirm(tenant_id=KIBO, source_dsn=DSN)
+
+    def comp(eid, dom):
+        return CrmEntity(KIBO, eid, "company", dom, f"company::{KIBO}::{dom}", [], {}, None)
+
+    entities = [
+        comp("ck", "kiboco.com"),   # Kibo Dealflow only
+        comp("cn", "nzyco.com"),    # referenced by a Nzyme opportunity only
+        comp("cb", "both.com"),     # both
+        comp("ci", "iso.com"),      # isolated
+        comp("cp", "person.com"),   # affiliated to a Nzyme-list person
+        CrmEntity(TENANT, "o1", "opportunity", "Deal", f"opportunity::{TENANT}::id:o1", [], {}, None),
+        CrmEntity(KIBO, "p1", "person", "Reyes", "person::reyes@kiboventures.com", [], {}, None,
+                  email="reyes@kiboventures.com"),
+    ]
+    edges = [
+        CrmEdge("o1", "cn", "contains", {}),
+        CrmEdge("o1", "cb", "contains", {}),
+        CrmEdge("p1", "cp", "works_at", {}),
+    ]
+    deals = [
+        _to_deal(entity_id="ck", list_name="Kibo Dealflow", stage_name="Lead",
+                 owner_emails=[], field_values={}, field_defs=[]),
+        _to_deal(entity_id="cb", list_name="Kibo Dealflow", stage_name="Lead",
+                 owner_emails=[], field_values={}, field_defs=[]),
+    ]
+    cf = ingest_mod.derive_company_firms(entities, edges, deals, firm)
+    assert cf["ck"] == {KIBO}              # Kibo dealflow list
+    assert cf["cn"] == {TENANT}            # Nzyme via opportunity `contains`
+    assert cf["cb"] == {KIBO, TENANT}      # both → shared
+    assert cf["ci"] == set()               # isolated → caller defaults to the firm
+    assert cf["cp"] == {TENANT}            # Nzyme-list person affiliation
 
 
 @pytest.mark.asyncio

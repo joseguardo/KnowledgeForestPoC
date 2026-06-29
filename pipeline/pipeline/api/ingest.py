@@ -13,6 +13,7 @@ from pipeline.access import (
 )
 from pipeline.adapters.affinidad import (
     AffinidadAdapter,
+    AffinidadFirm,
     CrmDeal,
     CrmEdge,
     CrmEntity,
@@ -20,6 +21,7 @@ from pipeline.adapters.affinidad import (
     CrmNote,
     communication_key,
     event_key,
+    list_tenant,
     load_affinidad_firms,
 )
 from pipeline.mcp_server.tenant_map import resolve_tenants
@@ -969,11 +971,13 @@ async def _apply_deal_attributes(
     client: EdgeFunctionClient,
     deal: CrmDeal,
     entity_by_id: dict[str, CrmEntity],
+    principals: list[str],
 ) -> dict | None:
     """A list membership → per-list namespaced attributes upserted on the company
     *or opportunity* pointer (re-inserting by canonical_key returns the existing
-    pointer + upserts attributes_kv). Inherits the entity's tenant (Kibo company /
-    Nzyme opportunity)."""
+    pointer + upserts attributes_kv). `principals` = the entity's firm acl
+    (involvement-derived for companies, Nzyme for opportunities) so the attribute
+    rows inherit the same visibility as the pointer."""
     ent = entity_by_id.get(deal.entity_id)
     if ent is None or not deal.attributes:
         return None
@@ -981,9 +985,38 @@ async def _apply_deal_attributes(
         label=ent.label,
         type=ent.kind,
         canonical_key=ent.canonical_key,
-        access_class=f"firm:{ent.tenant_id}",
+        principals=principals,
         attributes=_attr_dicts(deal.attributes),
     )
+
+
+def derive_company_firms(
+    entities: list[CrmEntity], edges: list[CrmEdge], deals: list[CrmDeal], firm: AffinidadFirm,
+) -> dict[str, set[str]]:
+    """Per-company firm set (acl), involvement-derived instead of fixed to Kibo by
+    kind. A company belongs to a firm when it is in that firm's dealflow list, an
+    opportunity of that firm references it (entity_edges, e.g. `contains`), or one
+    of that firm's people is affiliated with it. Empty set ⇒ caller defaults to the
+    firm (Kibo). Uses people's own list membership (`resolve_tenants`), never their
+    derived acl, so it does not depend on person-acl (no cycle)."""
+    entity_by_id = {e.entity_id: e for e in entities}
+    company_firms: dict[str, set[str]] = {e.entity_id: set() for e in entities if e.kind == "company"}
+    for d in deals:
+        if d.entity_id in company_firms:
+            company_firms[d.entity_id].add(list_tenant(firm, d.list_name))
+    for edge in edges:
+        s = entity_by_id.get(edge.source_id)
+        t = entity_by_id.get(edge.target_id)
+        if not s or not t:
+            continue
+        for me, other in ((s, t), (t, s)):
+            if me.kind != "company" or me.entity_id not in company_firms:
+                continue
+            if other.kind == "opportunity":
+                company_firms[me.entity_id].add(other.tenant_id)
+            elif other.kind == "person":
+                company_firms[me.entity_id].update(resolve_tenants(other.email or ""))
+    return company_firms
 
 
 async def _ingest_crm_note(
@@ -1205,6 +1238,13 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
         except _INGEST_ERRORS as exc:
             events = []
             _fail(exc)
+        # Deals (list memberships) are needed up front too: a company's firm(s) are
+        # derived from its dealflow-list membership, not just its kind.
+        try:
+            deals = await adapter.fetch_deals(firm)
+        except _INGEST_ERRORS as exc:
+            deals = []
+            _fail(exc)
 
         def _meeting_firms(ev: CrmEvent) -> set[str]:
             fs: set[str] = set()
@@ -1215,12 +1255,21 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
             return fs or {firm.tenant_id}
         ev_firms = {ev.event_id: _meeting_firms(ev) for ev in events}
 
+        # Per-company firm set (acl): involvement-derived (see derive_company_firms),
+        # computed before persons and independent of person-acl (no cycle).
+        company_firms = derive_company_firms(entities, edges, deals, firm)
+
+        def _company_acl(eid: str) -> list[str]:
+            return sorted(company_firms.get(eid) or {firm.tenant_id})
+
         # Per-person tenant set (acl): own firm (if internal) ∪ firms of the
         # companies/opportunities they're edged to ∪ firms of meetings they attend.
         person_tenants: dict[str, set[str]] = {}
         def _add_pt(eid: str, tenants) -> None:
             if tenants:
                 person_tenants.setdefault(eid, set()).update(tenants)
+        def _affiliated_firms(ent: CrmEntity) -> list[str]:
+            return _company_acl(ent.entity_id) if ent.kind == "company" else [ent.tenant_id]
         for e in entities:
             if e.kind == "person":
                 person_tenants.setdefault(e.entity_id, set())
@@ -1230,9 +1279,9 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
             t = entity_by_id.get(edge.target_id)
             if s and t:
                 if s.kind == "person" and t.kind in ("company", "opportunity"):
-                    _add_pt(s.entity_id, {t.tenant_id})
+                    _add_pt(s.entity_id, _affiliated_firms(t))
                 if t.kind == "person" and s.kind in ("company", "opportunity"):
-                    _add_pt(t.entity_id, {s.tenant_id})
+                    _add_pt(t.entity_id, _affiliated_firms(s))
         for ev in events:
             for (_et, pid, _role, _resp) in ev.participants:
                 ent = entity_by_id.get(pid)
@@ -1248,11 +1297,20 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
                 ent = entity_by_id.get(eid)
                 if not ent:
                     continue
-                out.update(_person_acl(eid) if ent.kind == "person" else {ent.tenant_id})
+                if ent.kind == "person":
+                    out.update(_person_acl(eid))
+                elif ent.kind == "company":
+                    out.update(_company_acl(eid))
+                else:
+                    out.add(ent.tenant_id)
             return sorted(out or {firm.tenant_id})
 
+        def _entity_principals(ent: CrmEntity) -> list[str]:
+            # company → involvement-derived; opportunity → its (Nzyme) tenant.
+            return _company_acl(ent.entity_id) if ent.kind == "company" else [ent.tenant_id]
+
         async def _do_company_opp(ent):
-            resp = await _ingest_crm_entity(client, ent, access_class=f"firm:{ent.tenant_id}")
+            resp = await _ingest_crm_entity(client, ent, principals=_entity_principals(ent))
             pid = resp.get("pointer_id")
             if pid:
                 ptr_by_entity[ent.entity_id] = pid
@@ -1273,12 +1331,15 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
             await _run(edges, lambda edge: _ingest_crm_edge(client, edge, resolve, _edge_principals(edge)))
 
         if "deals" in objects:
-            try:
-                deals = await adapter.fetch_deals(firm)
-            except _INGEST_ERRORS as exc:
-                deals = []
-                _fail(exc)
-            await _run(deals, lambda deal: _apply_deal_attributes(client, deal, entity_by_id))
+            def _deal_principals(deal: CrmDeal) -> list[str]:
+                ent = entity_by_id.get(deal.entity_id)
+                return _entity_principals(ent) if ent else [firm.tenant_id]
+            await _run(
+                deals,
+                lambda deal: _apply_deal_attributes(
+                    client, deal, entity_by_id, _deal_principals(deal)
+                ),
+            )
 
         if "notes" in objects:
             try:

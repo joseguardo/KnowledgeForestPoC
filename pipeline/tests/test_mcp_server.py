@@ -284,8 +284,11 @@ def test_resolve_tenants_rules(monkeypatch):
     monkeypatch.setattr(settings, "mcp_tenant_firms", None)  # use baked-in defaults
     assert resolve_tenants("reyes@kiboventures.com") == [NZYME_TENANT]  # Nzyme list only
     assert resolve_tenants("nacho@kiboventures.com") == [KIBO_TENANT]  # Kibo list only
-    assert set(resolve_tenants("niklas@kiboventures.com")) == {KIBO_TENANT, NZYME_TENANT}  # both
-    assert set(resolve_tenants("juan@kiboventures.com")) == {KIBO_TENANT, NZYME_TENANT}  # both lists
+    # juan/niklas/jaaz are Kibo-only now (removed from the Nzyme list to stop
+    # their meetings leaking Nzyme acl onto Kibo deals)
+    assert resolve_tenants("niklas@kiboventures.com") == [KIBO_TENANT]
+    assert resolve_tenants("juan@kiboventures.com") == [KIBO_TENANT]
+    assert resolve_tenants("jaaz@kiboventures.com") == [KIBO_TENANT]
     assert resolve_tenants("someone@nzalpha.com") == [NZYME_TENANT]  # domain
     assert resolve_tenants("juan@aallende.com") == [KIBO_TENANT]  # non-kibo domain, on Kibo list
     assert resolve_tenants("x@gmail.com") == []  # no match
@@ -315,8 +318,18 @@ async def test_ensure_tenant_member_upserts():
 
 @pytest.mark.asyncio
 async def test_callback_auto_assigns_tenants(monkeypatch):
+    import json
+
     import pipeline.mcp_server.server as srv
     from pipeline.mcp_server.tenant_map import KIBO_TENANT, NZYME_TENANT
+
+    # Membership is additive — a user matching several firms joins all of them.
+    # No baked-in email is dual-listed anymore, so configure a two-firm overlap
+    # explicitly to exercise the multi-tenant path.
+    monkeypatch.setattr(settings, "mcp_tenant_firms", json.dumps([
+        {"tenant_id": KIBO_TENANT, "domains": ["kiboventures.com"], "emails": []},
+        {"tenant_id": NZYME_TENANT, "domains": ["kiboventures.com"], "emails": []},
+    ]))
 
     session = {
         "client_id": "c1",

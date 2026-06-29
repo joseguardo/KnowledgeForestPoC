@@ -38,6 +38,17 @@ def _entity_tenant(firm: "AffinidadFirm", kind: str | None) -> str:
     return NZYME_TENANT if kind == "opportunity" else firm.tenant_id
 
 
+# CRM lists whose entries belong to Nzyme's pipeline. A company's firm(s) are
+# derived from involvement (its dealflow-list membership + the opportunities that
+# reference it), not just its kind — see `_company_acl` in api/ingest.py — so this
+# maps a list name to the firm that owns it.
+_NZYME_LIST_NAMES = {"nzyme dealflow", "lp funnel"}
+
+
+def list_tenant(firm: "AffinidadFirm", list_name: str | None) -> str:
+    return NZYME_TENANT if (list_name or "").strip().lower() in _NZYME_LIST_NAMES else firm.tenant_id
+
+
 # ── Per-firm connector config ───────────────────────────────────────
 
 
@@ -123,6 +134,7 @@ class CrmEdge:
 @dataclass
 class CrmDeal:
     entity_id: str          # source entities.id (company OR opportunity) in the list
+    list_name: str          # the CRM list this entry is in (routes the firm)
     attributes: list[Attr]  # per-list namespaced (e.g. "Dealflow:Stage")
 
 
@@ -386,7 +398,7 @@ def _to_deal(
             continue
         dt = _FIELD_DATA_TYPE.get(str(fd.get("type") or "text"), "string")
         attrs.append((f"{list_name}:{label}", val, dt))
-    return CrmDeal(entity_id=str(entity_id), attributes=attrs)
+    return CrmDeal(entity_id=str(entity_id), list_name=list_name, attributes=attrs)
 
 
 def _iso(value: Any) -> str | None:

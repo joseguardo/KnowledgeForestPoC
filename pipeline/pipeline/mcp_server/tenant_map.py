@@ -23,16 +23,19 @@ _KIBO_EMAILS = {
     "jma@kiboventures.com", "jordi@kiboventures.com", "aquilino@kiboventures.com",
     "lucia@kiboventures.com",
 }
+# NOTE: juan@, niklas@, jaaz@kiboventures.com were removed here — they are Kibo
+# people who were wrongly dual-listed, which unioned Nzyme onto every meeting they
+# attended (cross-tenant leakage, e.g. Fossa). They live in _KIBO_EMAILS only.
 _NZYME_EMAILS = {
     "reyes@kiboventures.com", "santiago@kiboventures.com", "alf@kiboventures.com",
     "vicente@kiboventures.com", "gpa@kiboventures.com", "pablo@kiboventures.com",
-    "juan@kiboventures.com", "jmg@kiboventures.com", "jaimegervas@kiboventures.com",
+    "jmg@kiboventures.com", "jaimegervas@kiboventures.com",
     "jaimepedrosa@kiboventures.com", "pablomayoral@kiboventures.com",
     "miguel@kiboventures.com", "aris@kiboventures.com", "jacob@kiboventures.com",
     "guillermo@kiboventures.com", "natalia@kiboventures.com", "mar@kiboventures.com",
-    "jaaz@kiboventures.com", "fernando@kiboventures.com", "gsa@kiboventures.com",
+    "fernando@kiboventures.com", "gsa@kiboventures.com",
     "ignacio@kiboventures.com", "sakhee.joisher@nzalpha.com",
-    "alvaro.fresnillo@nzalpha.com", "niklas@kiboventures.com", "jose.guardo@nzyme.com",
+    "alvaro.fresnillo@nzalpha.com", "jose.guardo@nzyme.com",
 }
 
 
