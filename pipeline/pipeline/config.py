@@ -175,7 +175,7 @@ class Settings(BaseSettings):
     mcp_public_base_url: str = "http://localhost:8000"
     # Comma-separated email domains allowed to authenticate via the MCP server
     # (defence-in-depth, checked at the Supabase callback and per request).
-    mcp_allowed_email_domains: str = "kiboventures.com,nzalpha.com"
+    mcp_allowed_email_domains: str = "kiboventures.com,nzalpha.com,nzyme.com"
     # Optional override for email→tenant auto-assignment (defaults are baked into
     # mcp_server/tenant_map.py). JSON array: [{tenant_id, domains[], emails[]}].
     # On MCP login the user is auto-added to tenant_members for their resolved
