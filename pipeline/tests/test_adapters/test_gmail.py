@@ -408,9 +408,9 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
     assert ("person", "person::me@kiboventures.com") in inserted
     assert "person::info@gohub.vc" not in keys
     # exactly one event, subject-free, under the firm class.
-    events = [ck for t, ck in inserted if t == "message"]
+    events = [ck for t, ck in inserted if t == "communication"]
     assert len(events) == 1
-    assert "secret" not in inserted[("message", events[0])]["label"].lower()
+    assert "secret" not in inserted[("communication", events[0])]["label"].lower()
     assert all(c.kwargs["access_class"] == "firm:T1" for c in client.insert_pointer.call_args_list)
 
     links = {(c.kwargs["source_id"], c.kwargs["relationship_type"], c.kwargs["target_id"])
@@ -428,7 +428,7 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
     assert dkw.get("access_class") is None
     assert dkw["canonical_key_namespace"] == "T1"
     assert dkw["link"]["target_id"] == events[0]
-    assert dkw["link"]["relationship_type"] == "email_content"
+    assert dkw["link"]["relationship_type"] == "communication_content"
     assert "Body." in dkw["content"]
     assert dkw["metadata"]["thread_id"] == "TH"
 
@@ -461,7 +461,7 @@ async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client
 
     async def fake_insert(**kw):
         # the message node already exists → merged; entities otherwise created
-        status = "merged" if kw["type"] == "message" else "created"
+        status = "merged" if kw["type"] == "communication" else "created"
         return {"status": status, "pointer_id": kw["canonical_key"]}
 
     client = AsyncMock()
@@ -526,7 +526,7 @@ async def test_ingest_gmail_ingests_and_links_attachments(async_client, monkeypa
     assert a["link"]["target_id"].startswith("message:T1:gmail:")
     assert a["metadata"]["attachment_filename"] == "notes.txt"
     # the body is still ingested too
-    assert any((c.kwargs.get("link") or {}).get("relationship_type") == "email_content"
+    assert any((c.kwargs.get("link") or {}).get("relationship_type") == "communication_content"
                for c in client.ingest_document.call_args_list)
 
 

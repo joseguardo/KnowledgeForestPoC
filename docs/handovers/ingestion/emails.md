@@ -43,10 +43,12 @@ carve-out) is unchanged from the legacy path.
 
 **Atomic unit: per message** (thread implicit via `thread_id` metadata; no
 conversation node). Each email →
-- **message** — its own pointer type (not `event`; `event` stays for meetings/
-  calendar/CRM). Keyed `message:{tenant}:gmail:{hash}` (hash of `Message-ID`,
-  fallback synthetic); `occurred_at` = message date; metadata `{event_type:email,
-  thread_id, direction, mailbox}`; subject-free label.
+- **communication** — pointer type `communication` (shared with Affinidad/Calendar
+  comms; **was `message`**). Keyed `message:{tenant}:gmail:{hash}` (**key prefix
+  unchanged** — hash of `Message-ID`, fallback synthetic); `occurred_at` = message
+  date; metadata `{event_type:email, thread_id, direction, mailbox}` — `event_type`
+  is the *medium* (email), like Affinidad's email/call/message communications;
+  subject-free label.
 - **person** per human address; label = display name.
 - **company** per *qualifying* domain, keyed `company::{tenant}::{domain}` so it
   merges with the CRM company; label = CRM name else derived from domain.
@@ -55,12 +57,12 @@ conversation node). Each email →
 - **free-mail** → person only; **own domain** → colleague; **noise** → skipped.
 
 **Edges:**
-- `person -sent-> message` — the sender (a company, for a role-mailbox sender)
-- `message -received-> person` — each recipient (to + cc; persons only)
+- `person -sent-> communication` — the sender (a company, for a role-mailbox sender)
+- `communication -received-> person` — each recipient (to + cc; persons only)
 - `person -affiliated_with-> company` — a person's own company (companies are
   reached via their people, 2-hop).
 
-**Deferred — `message -about-> company/person`.** An `about` (subject) edge would
+**Deferred — `communication -about-> company/person`.** An `about` (subject) edge would
 make entity-centric queries 1-hop, but it's *inferred*, not observed: "emailed a
 Fossa partner" ≠ "about Fossa," derived/platform domains aren't really companies,
 and `about→person` just restates `received`. We only want `about` with high
@@ -71,8 +73,10 @@ aggregation (weights/strength) is also a later step.
 ### Message content (private body)
 
 Each email's subject+body is ingested as a **private `document`** (chunked +
-embedded by `ingest-document`), linked `document --email_content--> message`. The
-message node stays firm-wide and subject-free; the content is participant-private.
+embedded by `ingest-document`), linked `document --communication_content-->
+communication` (same relationship Affinidad uses for its comms; **was
+`email_content`**). The communication node stays firm-wide and subject-free; the
+body behaves like any other document and the content is participant-private.
 
 Access uses **thread membership**, not per-thread access classes:
 - bodies carry one shared sentinel class **`email_body`** (not public, never
@@ -86,15 +90,15 @@ Access uses **thread membership**, not per-thread access classes:
   a member sees the doc+chunks, a non-member and anon see nothing.
 
 Dedup/idempotency: the doc is content-hash keyed (tenant-namespaced), and the
-body is ingested **only when the message pointer is newly `created`** — so the
+body is ingested **only when the communication pointer is newly `created`** — so the
 sender/recipient copies and `since_last` overlaps never re-embed. Semantic
-"email about XY" runs over the document/chunks (the message-node embedding is
+"email about XY" runs over the document/chunks (the communication-node embedding is
 label-only). Content is UTF-16-truncated to `max_content_length`.
 
 ### Attachments
 
 Real document attachments are ingested as their own `document` nodes, linked
-`document --attachment--> message`, with the **same visibility as the body**
+`document --attachment--> communication`, with the **same visibility as the body**
 (`principals` = the thread members with accounts). They ride the already-fetched
 raw RFC822, so no extra Gmail calls. `_extract_attachments` (gmail.py) keeps only
 parts with a filename and `attachment` disposition, dropping inline images,
@@ -178,11 +182,11 @@ curl -XPOST localhost:8000/api/v1/ingest/gmail \
 ```
 Then on KnowledgeForest (`sjiepibqadbdowcizccw`):
 ```sql
--- per-message nodes exist (emails are type 'message', not 'event')
+-- per-message nodes exist (emails are type 'communication')
 select metadata->>'direction', count(*) from pointers
-where type='message' and metadata->>'event_type'='email' group by 1;
--- private bodies linked to their messages
-select count(*) from edges where relationship_type='email_content';
+where type='communication' and metadata->>'event_type'='email' group by 1;
+-- private bodies linked to their communications
+select count(*) from edges where relationship_type='communication_content';
 -- thread participants who can read bodies
 select count(*) from thread_membership;
 -- companies / affiliations

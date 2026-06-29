@@ -39,7 +39,7 @@ def test_message_key_matches_extract_graph():
     """The orchestration recomputes the same message canonical key the graph uses."""
     msgs = [_msg(("me@kiboventures.com", "Me"), to=[("ana@gohub.vc", "Ana")], mid="<a@x>")]
     g = extract_graph(msgs, crm_domains=set(), crm_names={}, own_domains=OWN)
-    msg_ck = next(e.canonical_key for e in g.entities if e.type == "message")
+    msg_ck = next(e.canonical_key for e in g.entities if e.type == "communication")
     assert message_key("T1", "<a@x>") == msg_ck
 
 
@@ -56,7 +56,7 @@ def test_outbound_to_crm_domain_builds_person_company_and_edges():
     assert {me, ana, gohub} <= set(ents)
     assert ents[gohub].type == "company" and ents[gohub].label == "GoHub Ventures"
     # one event for the message
-    events = [e for e in g.entities if e.type == "message"]
+    events = [e for e in g.entities if e.type == "communication"]
     assert len(events) == 1
     ev = events[0].canonical_key
 
@@ -122,7 +122,7 @@ def test_event_is_per_message_subject_free_with_metadata():
              subject="Re: Q3 secret terms"),
     ]
     g = extract_graph(msgs, crm_domains={"gohub.vc"}, crm_names={}, own_domains=OWN)
-    events = [e for e in g.entities if e.type == "message"]
+    events = [e for e in g.entities if e.type == "communication"]
     assert len(events) == 2                      # one per message, not one per thread
     for e in events:
         assert "secret" not in e.label.lower()   # subject stays private

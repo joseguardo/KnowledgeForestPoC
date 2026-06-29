@@ -26,6 +26,17 @@ from pipeline.errors import AdapterError, ValidationError
 # Connection seam: tests inject a fake connect() returning a stub connection.
 ConnectFn = Callable[[str], Awaitable[Any]]
 
+# Affinidad holds BOTH firms' pipelines in one CRM: companies are Kibo's
+# dealflow, opportunities (dealflow + LP funnel) are Nzyme's. So an entity's
+# tenant routes by kind — company/person default to the firm (Kibo), opportunity
+# to Nzyme. (Mirrors mcp_server.tenant_map.NZYME_TENANT; kept local to avoid
+# importing the MCP package here. Revisit if a company ever joins an Nzyme list.)
+NZYME_TENANT = "baa52eca-4c88-4861-9d45-720e743febb4"
+
+
+def _entity_tenant(firm: "AffinidadFirm", kind: str | None) -> str:
+    return NZYME_TENANT if kind == "opportunity" else firm.tenant_id
+
 
 # ── Per-firm connector config ───────────────────────────────────────
 
@@ -111,7 +122,7 @@ class CrmEdge:
 
 @dataclass
 class CrmDeal:
-    company_id: str         # source entities.id of the company in the list
+    entity_id: str          # source entities.id (company OR opportunity) in the list
     attributes: list[Attr]  # per-list namespaced (e.g. "Dealflow:Stage")
 
 
@@ -137,7 +148,7 @@ class CrmEvent:
     body: str               # flattened from events.body jsonb blocks
     occurred_at: str | None
     metadata: dict[str, Any]
-    participants: list[tuple[str, str, str]]  # (entity_type, entity_id, role)
+    participants: list[tuple[str, str, str, str | None]]  # (entity_type, entity_id, role, response_status)
 
 
 # ── Canonical-key helpers (shared scheme with Gmail/Notes connectors) ─
@@ -155,8 +166,18 @@ def person_key(tenant: str, email: str | None, entity_id: str) -> str:
     return f"person::{e}" if e else f"person::{tenant}::id:{entity_id}"
 
 
-def event_key(tenant: str, event_id: str) -> str:
-    return f"event::{tenant}::affinidad::{event_id}"
+def opportunity_key(tenant: str, entity_id: str) -> str:
+    """Opportunities (dealflow/LP) have no domain/email — keyed by source id,
+    tenant-scoped (they belong to one firm's pipeline)."""
+    return f"opportunity::{tenant}::id:{entity_id}"
+
+
+def communication_key(tenant: str, event_id: str) -> str:
+    return f"communication::{tenant}::affinidad::{event_id}"
+
+
+# Back-compat alias (older callers/tests referenced event_key).
+event_key = communication_key
 
 
 # ── Normalizers (pure) ──────────────────────────────────────────────
@@ -208,6 +229,7 @@ def _to_entity(tenant: str, row: dict[str, Any], emails: dict[str, list[str]]) -
 
     attrs: list[Attr] = []
     email: str | None = None
+    owner = _str(row.get("owner_email"))
     if kind == "company":
         label = _str(row.get("name")) or "Unknown company"
         ck = company_key(tenant, row.get("domain"), eid)
@@ -217,6 +239,20 @@ def _to_entity(tenant: str, row: dict[str, Any], emails: dict[str, list[str]]) -
             v = _str(row.get(col))
             if v:
                 attrs.append((key, v, "string"))
+        if owner:
+            attrs.append(("Owner", owner, "string"))
+    elif kind == "opportunity":
+        # Dealflow / LP opportunities — a distinct CRM noun, keyed by source id.
+        label = _str(row.get("name")) or _str(row.get("full_name")) or "Unknown opportunity"
+        ck = opportunity_key(tenant, eid)
+        for key, col in (("Status", "status"), ("Sector", "sector"),
+                         ("Location", "location"), ("Description", "description"),
+                         ("Domain", "domain"), ("Website", "website")):
+            v = _str(row.get(col))
+            if v:
+                attrs.append((key, v, "string"))
+        if owner:
+            attrs.append(("Owner", owner, "string"))
     else:  # person
         label = _str(row.get("full_name")) or _str(row.get("name")) or _str(row.get("email")) or "Unknown person"
         email = (row.get("email") or "").strip().lower() or None
@@ -263,7 +299,7 @@ def _flatten_blocks(body: Any) -> str:
     return "\n\n".join(parts)
 
 
-def _to_event(tenant: str, row: dict[str, Any], participants: list[tuple[str, str, str]]) -> CrmEvent:
+def _to_event(tenant: str, row: dict[str, Any], participants: list[tuple[str, str, str, str | None]]) -> CrmEvent:
     eid = str(row["id"])
     typ = str(row.get("type") or "other")
     occurred_at = _iso(row.get("occurred_at"))
@@ -303,7 +339,7 @@ def _to_note(tenant: str, row: dict[str, Any], links: list[tuple[str, str]]) -> 
     body = str(row.get("body") or "").strip()
     occurred_at = _iso(row.get("created_at"))
     date_hint = (occurred_at or "")[:10]
-    label = f"Note · {date_hint}" if date_hint else "Note"
+    label = f"Content · {date_hint}" if date_hint else "Content"
     return CrmNote(
         tenant_id=tenant, note_id=nid, label=label, body=body,
         author_email=_str(row.get("author_email")),
@@ -323,7 +359,7 @@ _FIELD_DATA_TYPE = {
 
 def _to_deal(
     *,
-    company_id: str,
+    entity_id: str,
     list_name: str,
     stage_name: str | None,
     owner_emails: list[str] | None,
@@ -350,7 +386,7 @@ def _to_deal(
             continue
         dt = _FIELD_DATA_TYPE.get(str(fd.get("type") or "text"), "string")
         attrs.append((f"{list_name}:{label}", val, dt))
-    return CrmDeal(company_id=str(company_id), attributes=attrs)
+    return CrmDeal(entity_id=str(entity_id), attributes=attrs)
 
 
 def _iso(value: Any) -> str | None:
@@ -401,7 +437,7 @@ class AffinidadAdapter:
             )]
             rows = [dict(r) for r in await conn.fetch(
                 "SELECT id, kind, name, full_name, domain, email, website, description, "
-                "sector, status, location, phone, title, linkedin_url, affinity_id "
+                "sector, status, location, phone, title, linkedin_url, owner_email, affinity_id "
                 "FROM entities"
             )]
         except Exception as exc:
@@ -409,7 +445,7 @@ class AffinidadAdapter:
         finally:
             await _close(conn)
         emails = emails_by_entity(email_rows)
-        return [_to_entity(firm.tenant_id, r, emails) for r in rows]
+        return [_to_entity(_entity_tenant(firm, r.get("kind")), r, emails) for r in rows]
 
     async def fetch_edges(
         self, firm: AffinidadFirm, connect: ConnectFn = _default_connect
@@ -458,7 +494,7 @@ class AffinidadAdapter:
                 except (json.JSONDecodeError, ValueError):
                     fields = {}
             deals.append(_to_deal(
-                company_id=er["company_id"],
+                entity_id=er["company_id"],  # source column name; holds company OR opportunity id
                 list_name=str(er.get("list_name") or "List"),
                 stage_name=_str(er.get("stage_name")),
                 owner_emails=list(er.get("owner_emails") or []),
@@ -507,8 +543,10 @@ class AffinidadAdapter:
         conn = await self._connect(firm, connect)
         try:
             part_rows = [dict(r) for r in await conn.fetch(
-                "SELECT event_id, entity_type, entity_id, role FROM event_participants"
+                "SELECT event_id, entity_type, entity_id, role, response_status FROM event_participants"
             )]
+            # Scope: meetings only this round (the ~29.6k content-less emails are a
+            # separate pass). type='meeting' filters them at the source.
             if since:
                 try:
                     since_dt = datetime.fromisoformat(since)
@@ -517,14 +555,14 @@ class AffinidadAdapter:
                 rows = [dict(r) for r in await conn.fetch(
                     "SELECT id, type, occurred_at, direction, status, subject, body, "
                     "thread_id, source, external_id, metadata FROM events "
-                    "WHERE updated_at > $1 ORDER BY occurred_at ASC NULLS LAST LIMIT $2",
+                    "WHERE type='meeting' AND updated_at > $1 ORDER BY occurred_at ASC NULLS LAST LIMIT $2",
                     since_dt, cap,
                 )]
             else:
                 rows = [dict(r) for r in await conn.fetch(
                     "SELECT id, type, occurred_at, direction, status, subject, body, "
                     "thread_id, source, external_id, metadata FROM events "
-                    "ORDER BY occurred_at ASC NULLS LAST LIMIT $1",
+                    "WHERE type='meeting' ORDER BY occurred_at ASC NULLS LAST LIMIT $1",
                     cap,
                 )]
         except AdapterError:
@@ -534,10 +572,11 @@ class AffinidadAdapter:
         finally:
             await _close(conn)
 
-        parts_by_event: dict[str, list[tuple[str, str, str]]] = {}
+        parts_by_event: dict[str, list[tuple[str, str, str, str | None]]] = {}
         for pr in part_rows:
             parts_by_event.setdefault(str(pr["event_id"]), []).append(
-                (str(pr["entity_type"]), str(pr["entity_id"]), str(pr.get("role") or "attendee"))
+                (str(pr["entity_type"]), str(pr["entity_id"]),
+                 str(pr.get("role") or "attendee"), _str(pr.get("response_status")))
             )
         return [_to_event(firm.tenant_id, r, parts_by_event.get(str(r["id"]), [])) for r in rows]
 

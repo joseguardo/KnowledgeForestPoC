@@ -18,10 +18,12 @@ from pipeline.adapters.affinidad import (
     _to_entity,
     _to_event,
     _to_note,
+    communication_key,
     company_key,
     emails_by_entity,
     event_key,
     load_affinidad_firms,
+    opportunity_key,
     person_key,
 )
 from pipeline.config import settings
@@ -50,7 +52,13 @@ def test_person_key_prefers_email_else_id():
 
 
 def test_event_key_uses_source_event_id():
-    assert event_key(TENANT, "evt-9") == f"event::{TENANT}::affinidad::evt-9"
+    # meetings are now `communication` nodes (event_key is a back-compat alias)
+    assert event_key(TENANT, "evt-9") == f"communication::{TENANT}::affinidad::evt-9"
+    assert communication_key(TENANT, "evt-9") == f"communication::{TENANT}::affinidad::evt-9"
+
+
+def test_opportunity_key_is_id_scoped():
+    assert opportunity_key("baa", "o1") == "opportunity::baa::id:o1"
 
 
 # ── config parsing ──────────────────────────────────────────────────
@@ -118,6 +126,25 @@ def test_to_entity_company_builds_key_and_attributes():
     assert attrs["Location"] == "Madrid"
     assert ent.metadata["affinity_id"] == "aff-1"
     assert ent.occurred_at is None
+
+
+def test_to_entity_opportunity_is_opportunity_node_with_owner():
+    # The Nzyme tenant id stands in for the per-kind routing fetch_entities applies.
+    row = {"id": "o1", "kind": "opportunity", "name": "Project Zeta", "status": "Diligence",
+           "sector": "Fintech", "owner_email": "gp@kiboventures.com"}
+    ent = _to_entity("baa52eca", row, {})
+    assert ent.kind == "opportunity"                       # NOT corrupted into person
+    assert ent.canonical_key == "opportunity::baa52eca::id:o1"
+    assert ent.label == "Project Zeta"
+    attrs = {k: v for (k, v, _dt) in ent.attributes}
+    assert attrs["Status"] == "Diligence"
+    assert attrs["Owner"] == "gp@kiboventures.com"
+
+
+def test_to_entity_company_captures_owner():
+    ent = _to_entity(TENANT, {"id": "c1", "kind": "company", "name": "Acme",
+                              "domain": "acme.com", "owner_email": "ana@kibo.com"}, {})
+    assert ("Owner", "ana@kibo.com", "string") in ent.attributes
 
 
 def test_to_entity_person_uses_primary_email_and_email_list():
@@ -205,14 +232,14 @@ def test_to_deal_namespaces_attributes_per_list():
         {"key": "deal_size", "label": "Deal size", "type": "currency"},
     ]
     deal = _to_deal(
-        company_id="c1",
+        entity_id="c1",
         list_name="Dealflow",
         stage_name="Diligence",
         owner_emails=["ana@kibo.com"],
         field_values={"priority": "high", "deal_size": 5000000},
         field_defs=field_defs,
     )
-    assert deal.company_id == "c1"
+    assert deal.entity_id == "c1"
     attrs = {k: (v, dt) for (k, v, dt) in deal.attributes}
     assert attrs["Dealflow:Stage"] == ("Diligence", "string")
     # owners is a JSON array — must use the valid enum value "json", not "array"
@@ -290,7 +317,7 @@ async def test_ingest_crm_entity_company_attributes_and_class():
     ent = _to_entity(
         TENANT, {"id": "c1", "kind": "company", "name": "Acme", "domain": "acme.com", "sector": "Fintech"}, {}
     )
-    resp = await ingest_mod._ingest_crm_entity(client, ent, f"firm:{TENANT}")
+    resp = await ingest_mod._ingest_crm_entity(client, ent, access_class=f"firm:{TENANT}")
     kw = client.insert_pointer.call_args.kwargs
     assert kw["type"] == "company"
     assert kw["canonical_key"] == f"company::{TENANT}::acme.com"
@@ -330,10 +357,10 @@ async def test_apply_deal_attributes_upserts_on_company_pointer():
     client = _aclient()
     ent = _to_entity(TENANT, {"id": "c1", "kind": "company", "name": "Acme", "domain": "acme.com"}, {})
     deal = _to_deal(
-        company_id="c1", list_name="Dealflow", stage_name="Diligence",
+        entity_id="c1", list_name="Dealflow", stage_name="Diligence",
         owner_emails=["a@k.com"], field_values={}, field_defs=[],
     )
-    await ingest_mod._apply_deal_attributes(client, deal, {"c1": ent}, f"firm:{TENANT}")
+    await ingest_mod._apply_deal_attributes(client, deal, {"c1": ent})
     kw = client.insert_pointer.call_args.kwargs
     assert kw["type"] == "company"
     assert kw["canonical_key"] == f"company::{TENANT}::acme.com"
@@ -401,22 +428,24 @@ async def test_ingest_crm_event_node_firm_wide_body_private_with_grants(monkeypa
         {"id": "m1", "type": "meeting", "occurred_at": "2026-05-01T09:00:00+00:00", "subject": "Board",
          "body": [{"type": "paragraph", "text": "notes"}], "source": "crm", "external_id": "crm_meeting:x",
          "metadata": {}},
-        [("person", "p1", "attendee")],
+        [("person", "p1", "attendee", "accepted")],
     )
     await ingest_mod._ingest_crm_event(
-        AsyncMock(), client, ev, f"firm:{TENANT}", {"ana@kibo.com": "uid-a"}, resolve, {"p1": p}
+        AsyncMock(), client, ev, {TENANT}, {"ana@kibo.com": "uid-a"}, resolve, {"p1": p}, TENANT
     )
     ev_kw = client.insert_pointer.call_args.kwargs
-    assert ev_kw["type"] == "event"
-    assert ev_kw["canonical_key"] == event_key(TENANT, "m1")
-    assert ev_kw["access_class"] == f"firm:{TENANT}"  # event fact firm-wide → acl [tenant]
-    roles = {c.kwargs["relationship_type"] for c in client.link_pointers.call_args_list}
-    assert "attendee" in roles
-    # participant-only body → acl = participant uids (no class/grant), no firm class
+    assert ev_kw["type"] == "communication"                       # meeting → communication
+    assert ev_kw["canonical_key"] == communication_key(TENANT, "m1")
+    assert ev_kw["principals"] == [TENANT]                          # acl = attendee firms
+    lk = client.link_pointers.call_args.kwargs
+    assert lk["relationship_type"] == "attended"                   # collapsed from role
+    assert lk["payload"] == {"role": "attendee", "response_status": "accepted"}
+    # participant-only body → acl = participant uids, no firm class
     doc_kw = client.ingest_document.call_args.kwargs
     assert doc_kw["principals"] == ["uid-a"]
     assert doc_kw.get("access_class") is None
-    assert doc_kw["link"]["target_id"] == "ptr-1"  # body linked to the event node
+    assert doc_kw["link"]["target_id"] == "ptr-1"
+    assert doc_kw["link"]["relationship_type"] == "communication_content"
 
 
 @pytest.mark.asyncio
@@ -429,10 +458,10 @@ async def test_ingest_crm_event_no_body_skips_document(monkeypatch):
 
     ev = _to_event(
         TENANT,
-        {"id": "e9", "type": "email", "occurred_at": "2026-05-01T00:00:00+00:00", "subject": None,
-         "body": [], "source": "gmail", "external_id": "<m>", "metadata": {}},
+        {"id": "e9", "type": "meeting", "occurred_at": "2026-05-01T00:00:00+00:00", "subject": "Sync",
+         "body": [], "source": "crm", "external_id": "<m>", "metadata": {}},
         [],
     )
-    await ingest_mod._ingest_crm_event(AsyncMock(), client, ev, f"firm:{TENANT}", {}, resolve, {})
-    client.insert_pointer.assert_awaited_once()  # event node only
+    await ingest_mod._ingest_crm_event(AsyncMock(), client, ev, {TENANT}, {}, resolve, {}, TENANT)
+    client.insert_pointer.assert_awaited_once()  # communication node only
     client.ingest_document.assert_not_called()

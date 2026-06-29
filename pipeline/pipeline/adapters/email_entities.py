@@ -266,7 +266,7 @@ def extract_graph(
         direction = "out" if _domain(m.sender[0].lower()) in own else "in"
         msg_ck = message_key(tenant, m.message_id)
         add_entity(Entity(
-            msg_ck, "message", _event_label(m), occurred_at=m.occurred_at,
+            msg_ck, "communication", _event_label(m), occurred_at=m.occurred_at,
             metadata={"event_type": "email", "thread_id": m.thread_id,
                       "direction": direction, "mailbox": m.mailbox},
         ))

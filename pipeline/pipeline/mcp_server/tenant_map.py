@@ -32,7 +32,7 @@ _NZYME_EMAILS = {
     "guillermo@kiboventures.com", "natalia@kiboventures.com", "mar@kiboventures.com",
     "jaaz@kiboventures.com", "fernando@kiboventures.com", "gsa@kiboventures.com",
     "ignacio@kiboventures.com", "sakhee.joisher@nzalpha.com",
-    "alvaro.fresnillo@nzalpha.com", "niklas@kiboventures.com",
+    "alvaro.fresnillo@nzalpha.com", "niklas@kiboventures.com", "jose.guardo@nzyme.com",
 }
 
 
