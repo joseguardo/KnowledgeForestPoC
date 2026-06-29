@@ -24,7 +24,13 @@ def new_pkce_pair() -> tuple[str, str]:
 
 def google_authorize_url(code_challenge: str, session_id: str) -> str:
     """Supabase GoTrue authorize URL for Google with PKCE. Supabase redirects to
-    our /supabase-callback (with session_id) carrying a one-time `code`."""
+    our /supabase-callback (with session_id) carrying a one-time `code`.
+
+    `prompt=select_account` is forwarded by GoTrue to Google so every MCP
+    authorization shows the Google account chooser. Without it, Google silently
+    reuses whichever account the device is already signed into — so switching
+    Claude accounts on the same device would re-mint a token for the *previous*
+    identity instead of the one the user intends to log in as."""
     redirect_to = f"{supabase_callback_url()}?session_id={session_id}"
     params = {
         "provider": "google",
@@ -32,6 +38,7 @@ def google_authorize_url(code_challenge: str, session_id: str) -> str:
         "code_challenge": code_challenge,
         "code_challenge_method": "s256",
         "redirect_to": redirect_to,
+        "prompt": "select_account",
     }
     return f"{settings.supabase_url}/auth/v1/authorize?{urlencode(params)}"
 

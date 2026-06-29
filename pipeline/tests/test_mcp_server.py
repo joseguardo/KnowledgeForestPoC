@@ -196,6 +196,9 @@ async def test_provider_authorize_redirects_to_google(monkeypatch):
     )
     url = await p.authorize(_client(), params)
     assert "/auth/v1/authorize" in url and "provider=google" in url and "flow_type=pkce" in url
+    # forces Google's account chooser so switching accounts can't silently reuse
+    # the device's existing Google session
+    assert "prompt=select_account" in url
     # a pending session was stored with the client's challenge + a supabase verifier
     sessions = [v for v in store.values() if v["kind"] == "session"]
     assert len(sessions) == 1
