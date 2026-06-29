@@ -1,19 +1,25 @@
-"""Endpoint orchestration for /api/v1/ingest/notes (the reworked notes path).
+"""Endpoint orchestration for /api/v1/ingest/notes.
 
-Mirrors the Gmail per-message endpoint: the real `notes_entities.extract_graph`
-runs; only I/O (source fetch, CRM domain load, access provisioning, the edge
-client) is mocked. One meeting → an `event`, `attended`/`affiliated_with`/`about`
-edges via insert_pointer + link_pointers, and a body document.
+Calendar is the source of truth: a note is only ingested if it matches an
+already-ingested calendar meeting — it attaches its attendees and its content
+documents to that calendar event and never creates a meeting of its own. A note
+with no calendar match is dropped. The real `notes_entities.extract_graph` runs;
+only I/O (source fetch, CRM load, the edge client, calendar lookup) is mocked.
 """
 
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from pipeline.config import settings
+
+TENANT = "T1"
+DSN = "postgresql://u:p@h.pooler.supabase.com:5432/postgres"
+CAL = "cal-ev-1"  # the matched calendar event's pointer id
+GCAL_CK = f"event:{TENANT}:gcal:uid-1@google.com"
 
 
 @pytest.mark.asyncio
@@ -30,19 +36,14 @@ async def test_load_person_names_keeps_real_names_drops_email_labels():
             return [
                 {"canonical_key": "person::lp@poseidon.vc", "label": "Laura Páez"},
                 {"canonical_key": "person::bare@x.com", "label": "bare@x.com"},
-                {"canonical_key": "person::T1::id:42", "label": "No Domain"},  # tenant-scoped fallback
-                {"canonical_key": "person::z@z.com", "label": "Otra Persona"},  # any firm — global
+                {"canonical_key": "person::T1::id:42", "label": "No Domain"},
+                {"canonical_key": "person::z@z.com", "label": "Otra Persona"},
             ]
 
     http = AsyncMock()
     http.get = AsyncMock(return_value=_Resp())
-
     names = await ingest_mod._load_person_names(http, "T1")
     assert names == {"lp@poseidon.vc": "Laura Páez", "z@z.com": "Otra Persona"}
-
-
-TENANT = "T1"
-DSN = "postgresql://u:p@h.pooler.supabase.com:5432/postgres"
 
 
 def _note(**kw):
@@ -59,39 +60,50 @@ def _note(**kw):
         attendees=["gp@kiboventures.com", "lp@poseidon.vc"],
         external_org="poseidon-vc",
         confidential=False,
-        body="### Notes\nAll good.",
+        documents=[("notion_summary", "### Notes\nAll good.")],
     )
     base.update(kw)
     return MeetingNote(**base)
 
 
-def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None):
-    """Patch the notes endpoint's I/O seams; return (client, ensure_class,
-    ensure_user_grant)."""
+def _mock_http(get_rows=None):
+    """http for the calendar-lookup data layer. Returns the given calendar rows for
+    every select (find_calendar_event matches by title); [] = no calendar event."""
+    http = AsyncMock()
+    for verb in ("get", "patch", "delete", "post"):
+        resp = MagicMock()
+        resp.json.return_value = []
+        getattr(http, verb).return_value = resp
+    if get_rows is not None:
+        http.get.return_value.json.return_value = get_rows
+    return http
+
+
+def _cal_rows(label="Ext. Call Poseidon"):
+    return [{"id": CAL, "canonical_key": GCAL_CK, "label": label}]
+
+
+def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None,
+          calendar_rows=None):
     from pipeline.adapters.notes import NotesAdapter, NotesFetch
     from pipeline.api import ingest as ingest_mod
     from pipeline.main import app
 
+    app.state.http = _mock_http(get_rows=calendar_rows)
     monkeypatch.setattr(
         settings, "notes_firms", json.dumps([{"tenant_id": TENANT, "source_dsn": DSN}])
     )
 
     async def fake_fetch(self, firm, since=None, max_results=None):
-        return NotesFetch(
-            notes=notes, own_domains={"kiboventures.com"}, team_names=team_names or {}
-        )
+        return NotesFetch(notes=notes, own_domains={"kiboventures.com"},
+                          team_names=team_names or {})
 
     monkeypatch.setattr(NotesAdapter, "fetch_notes", fake_fetch)
-    monkeypatch.setattr(
-        ingest_mod, "_load_company_domains", AsyncMock(return_value={"poseidon.vc": "Poseidon"})
-    )
-    # CRM/graph person directory (email → name); without a name an attendee is dropped.
-    monkeypatch.setattr(
-        ingest_mod, "_load_person_names", AsyncMock(return_value=person_names or {})
-    )
+    monkeypatch.setattr(ingest_mod, "_load_company_domains",
+                        AsyncMock(return_value={"poseidon.vc": "Poseidon"}))
+    monkeypatch.setattr(ingest_mod, "_load_person_names",
+                        AsyncMock(return_value=person_names or {}))
     monkeypatch.setattr(ingest_mod, "resolve_user_ids", AsyncMock(return_value=user_ids))
-    # Rejection logging is a best-effort PostgREST write; stub it so the endpoint
-    # doesn't hit the network, and so tests can assert what got logged.
     monkeypatch.setattr(ingest_mod, "log_rejections", AsyncMock(return_value=0))
 
     async def fake_insert(**kw):
@@ -101,154 +113,118 @@ def _wire(monkeypatch, *, notes, user_ids, person_names=None, team_names=None):
     client.insert_pointer = AsyncMock(side_effect=fake_insert)
     client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
     app.state.client = client
-    return client, None, None
+    return client
 
 
 @pytest.mark.asyncio
-async def test_ingest_notes_builds_meeting_graph(async_client, monkeypatch):
-    client, _ensure_class, _ = _wire(
-        monkeypatch,
-        notes=[_note()],
+async def test_ingest_notes_attaches_to_calendar_event(async_client, monkeypatch):
+    """A matched note: no event node created, attendees/about/affiliation + the body
+    document all target the calendar event, edges provenance-tagged 'notes'."""
+    client = _wire(
+        monkeypatch, notes=[_note()],
         user_ids={"gp@kiboventures.com": "uid-gp"},
         person_names={"lp@poseidon.vc": "Laura Páez"},
+        calendar_rows=_cal_rows(),
     )
-
     resp = await async_client.post("/api/v1/ingest/notes", json={})
     assert resp.status_code == 200, resp.text
 
-    event_ck = f"event:{TENANT}:meetingnote:pg-1"
-    inserted = {(c.kwargs["type"], c.kwargs["canonical_key"]) for c in client.insert_pointer.call_args_list}
-    assert ("event", event_ck) in inserted
-    assert ("person", f"person::gp@kiboventures.com") in inserted
-    assert ("person", f"person::lp@poseidon.vc") in inserted
-    assert ("company", f"company::{TENANT}::poseidon.vc") in inserted
-    # everything firm-wide
-    assert all(c.kwargs["access_class"] == f"firm:{TENANT}" for c in client.insert_pointer.call_args_list)
-
-    # persons are labelled with names; email rides along as an attribute, not the label
+    # Notes never create an event node.
+    assert "event" not in {c.kwargs["type"] for c in client.insert_pointer.call_args_list}
+    # Persons are created (named; email as attribute, not the label).
     persons = {c.kwargs["canonical_key"]: c.kwargs
                for c in client.insert_pointer.call_args_list if c.kwargs["type"] == "person"}
-    gp = persons[f"person::gp@kiboventures.com"]
-    assert gp["label"] == "Guillermo Puebla"
-    assert gp["attributes"] == [
+    assert persons["person::gp@kiboventures.com"]["label"] == "Guillermo Puebla"
+    assert persons["person::gp@kiboventures.com"]["attributes"] == [
         {"key": "email", "value": "gp@kiboventures.com", "data_type": "string", "source": "notes"}
     ]
-    assert persons[f"person::lp@poseidon.vc"]["label"] == "Laura Páez"
+    assert persons["person::lp@poseidon.vc"]["label"] == "Laura Páez"
 
     links = {(c.kwargs["source_id"], c.kwargs["relationship_type"], c.kwargs["target_id"])
              for c in client.link_pointers.call_args_list}
-    assert (f"person::gp@kiboventures.com", "attended", event_ck) in links
-    assert (f"person::lp@poseidon.vc", "attended", event_ck) in links
-    assert (f"person::lp@poseidon.vc", "affiliated_with", f"company::{TENANT}::poseidon.vc") in links
-    # external_org resolves AND a poseidon.vc member attended → about edge
-    assert (event_ck, "about", f"company::{TENANT}::poseidon.vc") in links
-    # no owner/hosted relationship — just attended
-    assert not any(rel in ("hosted", "owner") for _s, rel, _t in links)
+    assert ("person::gp@kiboventures.com", "attended", CAL) in links
+    assert ("person::lp@poseidon.vc", "attended", CAL) in links
+    assert ("person::lp@poseidon.vc", "affiliated_with", f"company::{TENANT}::poseidon.vc") in links
+    assert (CAL, "about", f"company::{TENANT}::poseidon.vc") in links
+    assert all(c.kwargs.get("payload") == {"source": "notes"}
+               for c in client.link_pointers.call_args_list)
 
-    # shareable body → firm class, linked meeting_notes to the event
+    # Body document → content_of the calendar event, firm-wide.
     dkw = client.ingest_document.call_args.kwargs
+    assert dkw["link"] == {"target_id": CAL, "relationship_type": "content_of",
+                           "why": "Meeting notion_summary"}
     assert dkw["access_class"] == f"firm:{TENANT}"
-    assert dkw["link"]["target_id"] == event_ck
-    assert dkw["link"]["relationship_type"] == "meeting_notes"
-    assert dkw["canonical_key_namespace"] == TENANT
 
 
 @pytest.mark.asyncio
-async def test_ingest_notes_collapses_two_note_pages_into_one_event(async_client, monkeypatch):
-    slot = "2026-06-25T09:30:00+02:00"
-    notes = [
-        _note(page_id="pgA", title="Weekly", scheduled_at=slot, body="### Notes A"),
-        _note(page_id="pgB", title="Weekly", scheduled_at=slot, body="### Notes B"),
-    ]
-    client, _, _ = _wire(monkeypatch, notes=notes, user_ids={})
-
+async def test_ingest_notes_dropped_when_no_calendar_match(async_client, monkeypatch):
+    """No calendar event for the note → the note is dropped entirely (calendar is
+    the source of truth): no pointers, no documents."""
+    client = _wire(monkeypatch, notes=[_note()], user_ids={},
+                   person_names={"lp@poseidon.vc": "Laura Páez"}, calendar_rows=[])
     resp = await async_client.post("/api/v1/ingest/notes", json={})
     assert resp.status_code == 200, resp.text
-
-    events = {c.kwargs["canonical_key"] for c in client.insert_pointer.call_args_list
-              if c.kwargs["type"] == "event"}
-    assert len(events) == 1                                  # two pages → one meeting event
-    event_ck = next(iter(events))
-    assert ":meeting:" in event_ck                           # keyed by slot, not page_id
-
-    # both note bodies ingested as separate documents, both linked to the one event
-    doc_links = [c.kwargs["link"]["target_id"] for c in client.ingest_document.call_args_list]
-    assert len(doc_links) == 2
-    assert all(t == event_ck for t in doc_links)
+    client.insert_pointer.assert_not_called()
+    client.ingest_document.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ingest_notes_confidential_body_acl_is_participant_uids(async_client, monkeypatch):
-    client, _, _ = _wire(
+async def test_ingest_notes_two_content_fields_two_documents(async_client, monkeypatch):
+    """`notes` and `notion_summary` become two separate content_of documents."""
+    client = _wire(
         monkeypatch,
-        notes=[_note(confidential=True)],
-        user_ids={"gp@kiboventures.com": "uid-gp", "lp@poseidon.vc": "uid-lp"},
+        notes=[_note(documents=[("notes", "raw transcript"), ("notion_summary", "summary")])],
+        user_ids={}, person_names={"lp@poseidon.vc": "Laura Páez"},
+        calendar_rows=_cal_rows(),
     )
-
     resp = await async_client.post("/api/v1/ingest/notes", json={})
     assert resp.status_code == 200, resp.text
 
-    # confidential → body visibility carried by principals (owner + attendee uids),
-    # NOT a firm class; no access_class needed.
+    docs = client.ingest_document.call_args_list
+    assert len(docs) == 2
+    assert all(c.kwargs["link"]["target_id"] == CAL for c in docs)
+    assert {c.kwargs["metadata"]["field"] for c in docs} == {"notes", "notion_summary"}
+    assert {c.kwargs["content"] for c in docs} == {"raw transcript", "summary"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_notes_day_window_match_for_date_only(async_client, monkeypatch):
+    """A date-only note (midnight, no scheduled time) still matches a calendar event
+    on the same day by title (the hour wouldn't match)."""
+    note = _note(occurred_at="2026-06-19T00:00:00+00:00", is_datetime=False, scheduled_at=None)
+    client = _wire(monkeypatch, notes=[note], user_ids={},
+                   person_names={"lp@poseidon.vc": "Laura Páez"}, calendar_rows=_cal_rows())
+    resp = await async_client.post("/api/v1/ingest/notes", json={})
+    assert resp.status_code == 200, resp.text
+    # attached (body document targets the calendar event), not dropped
+    assert client.ingest_document.call_args.kwargs["link"]["target_id"] == CAL
+
+
+@pytest.mark.asyncio
+async def test_ingest_notes_confidential_docs_acl_is_participant_uids(async_client, monkeypatch):
+    client = _wire(
+        monkeypatch, notes=[_note(confidential=True)],
+        user_ids={"gp@kiboventures.com": "uid-gp", "lp@poseidon.vc": "uid-lp"},
+        calendar_rows=_cal_rows(),
+    )
+    resp = await async_client.post("/api/v1/ingest/notes", json={})
+    assert resp.status_code == 200, resp.text
     dkw = client.ingest_document.call_args.kwargs
     assert set(dkw["principals"]) == {"uid-gp", "uid-lp"}
     assert dkw.get("access_class") is None
 
 
 @pytest.mark.asyncio
-async def test_ingest_notes_drops_unresolved_owner(async_client, monkeypatch):
-    client, _, _ = _wire(
-        monkeypatch,
-        notes=[_note(owner_email=None, owner_name="Mystery Person", attendees=["lp@poseidon.vc"])],
-        user_ids={},
-        person_names={"lp@poseidon.vc": "Laura Páez"},
-    )
-
-    resp = await async_client.post("/api/v1/ingest/notes", json={})
-    assert resp.status_code == 200, resp.text
-
-    persons = {ck for t, ck in {(c.kwargs["type"], c.kwargs["canonical_key"])
-                                for c in client.insert_pointer.call_args_list} if t == "person"}
-    # no name-slug fallback node; only the resolvable attendee is a person
-    assert not any("::name:" in ck for ck in persons)
-    assert persons == {f"person::lp@poseidon.vc"}
-
-
-@pytest.mark.asyncio
-async def test_ingest_notes_drops_attendee_with_no_resolvable_name(async_client, monkeypatch):
-    # An attendee whose email resolves to no name (not in team/CRM directory) is
-    # dropped — no person pointer, no email-labelled node.
-    client, _, _ = _wire(
-        monkeypatch,
-        notes=[_note(owner_email=None, attendees=["mystery@unknown.com"])],
-        user_ids={},
-        person_names={},
-    )
-
-    resp = await async_client.post("/api/v1/ingest/notes", json={})
-    assert resp.status_code == 200, resp.text
-
-    persons = [c for c in client.insert_pointer.call_args_list if c.kwargs["type"] == "person"]
-    assert persons == []
-
-
-@pytest.mark.asyncio
 async def test_ingest_notes_logs_dropped_attendee_as_rejection(async_client, monkeypatch):
+    """Extraction still records unnamed attendees as rejections — for a matched note."""
     from pipeline.api import ingest as ingest_mod
 
-    _wire(
-        monkeypatch,
-        notes=[_note(owner_email=None, attendees=["mystery@unknown.com"])],
-        user_ids={},
-        person_names={},
-    )
-
+    _wire(monkeypatch,
+          notes=[_note(owner_email=None, attendees=["mystery@unknown.com"])],
+          user_ids={}, person_names={}, calendar_rows=_cal_rows())
     resp = await async_client.post("/api/v1/ingest/notes", json={})
     assert resp.status_code == 200, resp.text
 
     ingest_mod.log_rejections.assert_awaited_once()
-    _, kwargs = ingest_mod.log_rejections.call_args
-    rejs = kwargs["notes"]
-    assert [(r.reason, r.attendee) for r in rejs] == [
-        ("unnamed_attendee", "mystery@unknown.com"),
-    ]
+    rejs = ingest_mod.log_rejections.call_args.kwargs["notes"]
+    assert [(r.reason, r.attendee) for r in rejs] == [("unnamed_attendee", "mystery@unknown.com")]

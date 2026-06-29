@@ -64,6 +64,16 @@ def test_human_at_own_domain_is_colleague_no_company():
     assert c.company is None
 
 
+def test_service_room_and_alias_mailboxes_are_not_people():
+    # Service/dept accounts, firm aliases and meeting-room mailboxes on the own
+    # domain must NOT become person nodes (regression for the directory cleanup).
+    for lp in ("operations", "dev", "it", "kibo", "nzyme", "internalnzyme",
+               "salagrande", "salapequena"):
+        c = _classify(f"{lp}@kiboventures.com", None)
+        assert c.person is None, lp
+        assert c.company is None, lp  # own domain → no company either → fully dropped
+
+
 def test_human_at_unknown_external_domain_has_no_company():
     # not in CRM, never corresponded → person only
     c = _classify("x@stripe.com", "Stripe Bot")

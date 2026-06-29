@@ -428,7 +428,7 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
     assert dkw.get("access_class") is None
     assert dkw["canonical_key_namespace"] == "T1"
     assert dkw["link"]["target_id"] == events[0]
-    assert dkw["link"]["relationship_type"] == "communication_content"
+    assert dkw["link"]["relationship_type"] == "content_of"
     assert "Body." in dkw["content"]
     assert dkw["metadata"]["thread_id"] == "TH"
 
@@ -526,7 +526,7 @@ async def test_ingest_gmail_ingests_and_links_attachments(async_client, monkeypa
     assert a["link"]["target_id"].startswith("message:T1:gmail:")
     assert a["metadata"]["attachment_filename"] == "notes.txt"
     # the body is still ingested too
-    assert any((c.kwargs.get("link") or {}).get("relationship_type") == "communication_content"
+    assert any((c.kwargs.get("link") or {}).get("relationship_type") == "content_of"
                for c in client.ingest_document.call_args_list)
 
 

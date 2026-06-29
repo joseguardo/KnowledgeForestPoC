@@ -88,7 +88,12 @@ class Settings(BaseSettings):
     gmail_role_localparts: str = (
         "info,hello,contact,team,sales,support,help,admin,office,press,jobs,"
         "careers,hr,billing,accounts,marketing,newsletter,news,events,booking,"
-        "bookings,registration,invite,invites,deals,partnerships,partners,welcome"
+        "bookings,registration,invite,invites,deals,partnerships,partners,welcome,"
+        # service / ops / dept accounts and firm aliases that aren't a human:
+        "operations,dev,it,kibo,nzyme,nzymegermany,internalnzyme,enzyme,"
+        # meeting-room resource mailboxes (regular mailboxes, so not flagged as
+        # Google "resource" attendees — exclude them by local part):
+        "salagrande,salapequena"
     )
     # Role mailboxes that, when they are the SENDER, mean the message is not human
     # 1:1 correspondence (marketing/transactional) → drop it entirely. Narrower

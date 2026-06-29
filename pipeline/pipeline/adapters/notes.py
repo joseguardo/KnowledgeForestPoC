@@ -25,9 +25,15 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RE_TRAILING_ISO = re.compile(
     r"\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s*$"
 )
+# Leading "YYMMDD - HH:MM - " (or "YYMMDD - ") prefix some titles carry, e.g.
+# "260513 - 16:00 - Ext. Lavare continuación". Stripped so the title matches the
+# calendar event's (clean) summary. The prefix time is tz-ambiguous, so it's not
+# used for the clock — date-only notes match the calendar at day granularity.
+_RE_LEADING_DATE = re.compile(r"^\s*\d{6}\s*-\s*(?:\d{2}:\d{2}\s*-\s*)?")
 
 _DEFAULT_TABLE = "meeting_transcripts"
-_DEFAULT_CONTENT_FIELDS = ["notion_summary"]
+# Each content field becomes its OWN document linked to the meeting (not joined).
+_DEFAULT_CONTENT_FIELDS = ["notes", "notion_summary"]
 _DEFAULT_CONFIDENTIAL_FIELD = "confidential"
 _DEFAULT_OWNER_MAP_TABLES = [
     {"table": "ReportingNz_team_members", "name_col": "name", "email_col": "email"},
@@ -70,8 +76,12 @@ class MeetingNote:
     attendees: list[str]  # attendee emails (lowercased, deduped)
     external_org: str | None  # raw free-text org the meeting is "about"; resolved downstream
     confidential: bool
-    body: str  # joined content_fields; "" when none present
+    # One (field_name, content) per non-empty content field — each ingested as its
+    # OWN document linked to the meeting. Empty when the note has no content.
+    documents: list[tuple[str, str]] = field(default_factory=list)
     scheduled_at: str | None = None  # meeting's scheduled slot, parsed from the raw title
+    # Whether the source meeting_start is a real datetime (vs a date-only midnight).
+    is_datetime: bool = False
 
 
 @dataclass
@@ -198,7 +208,10 @@ class NotesAdapter:
         own_domains = {
             em.split("@", 1)[1] for em in owner_map.values() if "@" in em
         }
+        # Drop notes with no content at all (no `notes` and no `notion_summary`):
+        # nothing to attach to a meeting.
         notes = [_to_note(firm, dict(r), owner_map) for r in rows]
+        notes = [n for n in notes if n.documents]
         return NotesFetch(notes=notes, own_domains=own_domains, team_names=team_names)
 
 
@@ -232,6 +245,7 @@ async def _fetch_rows(conn: Any, firm: NotesFirm, since: str | None, cap: int) -
         "attendee_emails",
         "external_org",
         "meeting_start",
+        "meeting_is_datetime",
         "last_edited_time",
         f'"{firm.confidential_field}" AS confidential',
     ]
@@ -264,14 +278,14 @@ def _to_note(firm: NotesFirm, row: dict[str, Any], owner_map: dict[str, str]) ->
     external_org = (row.get("external_org") or "").strip() or None
     confidential = (row.get("confidential") or "").strip().lower() == "confidential"
 
-    parts = [
-        str(row[f]).strip()
-        for f in firm.content_fields
-        if row.get(f) is not None and str(row[f]).strip()
-    ]
-    body = "\n\n".join(parts)
-    if body:
-        _validate_content(body)
+    # Each content field is kept as its OWN document (field_name, content), not
+    # joined — so `notes` and `notion_summary` become two separate documents.
+    documents: list[tuple[str, str]] = []
+    for f in firm.content_fields:
+        if row.get(f) is not None and str(row[f]).strip():
+            content = str(row[f]).strip()
+            _validate_content(content)
+            documents.append((f, content))
 
     return MeetingNote(
         tenant_id=firm.tenant_id,
@@ -285,7 +299,8 @@ def _to_note(firm: NotesFirm, row: dict[str, Any], owner_map: dict[str, str]) ->
         attendees=attendees,
         external_org=external_org,
         confidential=confidential,
-        body=body,
+        documents=documents,
+        is_datetime=bool(row.get("meeting_is_datetime")),
     )
 
 
@@ -297,7 +312,9 @@ def slugify(value: str | None) -> str:
 def _clean_title(title: str | None) -> str:
     if not title:
         return "Meeting"
-    return _RE_TRAILING_ISO.sub("", str(title).strip()).strip() or "Meeting"
+    t = _RE_TRAILING_ISO.sub("", str(title).strip())
+    t = _RE_LEADING_DATE.sub("", t)
+    return t.strip() or "Meeting"
 
 
 def _scheduled_from_title(title: str | None) -> str | None:

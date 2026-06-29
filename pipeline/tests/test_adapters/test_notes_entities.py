@@ -27,7 +27,7 @@ def _note(**kw) -> MeetingNote:
         attendees=[],
         external_org=None,
         confidential=False,
-        body="",
+        documents=[],
     )
     base.update(kw)
     return MeetingNote(**base)

@@ -48,7 +48,7 @@ classify as person-only. `notes_entities.extract_graph` then produces, per row:
   `event:{tenant}:meetingnote:{page_id}`. So the **two/three Notion note-pages of
   one meeting** (different note-takers, different `page_id`) collapse to **one
   event** — while distinct occurrences (different slot) stay separate. Each
-  note-page's body stays its **own** `document` linked `meeting_notes -> ` that
+  note-page's body stays its **own** `document` linked `content_of -> ` that
   one event (notes don't merge; provenance per-doc via `page_id`). `occurred_at` =
   `scheduled_at` ?? `meeting_start` ?? `last_edited`; label = cleaned title.
 - **person** per **nameable** human (owner + attendees we can name). Keyed
@@ -109,7 +109,8 @@ dropped** (no `name:{slug}` fallback).
 ### Body (summary)
 
 Each meeting's `notion_summary` is ingested as a **document** (chunked +
-embedded), linked `document --meeting_notes--> event`. Access:
+embedded), linked `document --content_of--> event` (was `meeting_notes`, unified
+with the other content edges in `20260629130000`). Access:
 
 - **Shareable** → the firm class `firm:{tenant}` (public-within-firm).
 - **Confidential** → a private class `meetingnote:{tenant}:{page_id}`, ensured
@@ -196,7 +197,7 @@ select count(*) from edges where relationship_type='attended';
 select count(*) from edges where relationship_type='affiliated_with';
 select count(*) from edges where relationship_type='about';
 -- bodies linked to their meeting
-select count(*) from edges where relationship_type='meeting_notes';
+select count(*) from edges where relationship_type='content_of';
 -- no NEW person is labelled with a bare email; email lives as an attribute
 select count(*) from pointers where type='person' and label ~ '@' and label !~ '\s';
 select count(*) from attributes_kv where key='email';

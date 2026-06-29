@@ -75,7 +75,20 @@ def test_to_note_resolves_owner_email_and_dedups_attendees():
     assert note.confidential is False
     assert note.occurred_at == "2026-06-19T09:00:00+00:00"
     assert note.last_edited == "2026-06-19T10:41:00+00:00"
-    assert "Action Items" in note.body
+    # content fields become (field, content) documents — here just notion_summary
+    assert note.documents == [("notion_summary", "### Action Items\n- [ ] Do the thing")]
+
+
+def test_to_note_separate_documents_per_field_and_datetime_flag():
+    note = _to_note(
+        _firm(), _row(notes="raw transcript notes", meeting_is_datetime=True), {}
+    )
+    # notes AND notion_summary → two separate documents, in content_fields order
+    assert note.documents == [
+        ("notes", "raw transcript notes"),
+        ("notion_summary", "### Action Items\n- [ ] Do the thing"),
+    ]
+    assert note.is_datetime is True
 
 
 def test_to_note_captures_scheduled_at_from_title():
@@ -94,7 +107,7 @@ def test_to_note_scheduled_at_none_without_iso():
 def test_to_note_confidential_and_empty_body():
     note = _to_note(_firm(), _row(confidential="Confidential", notion_summary=None), {})
     assert note.confidential is True
-    assert note.body == ""
+    assert note.documents == []  # no notes, no summary → dropped by fetch_notes
     assert note.owner_email is None  # unresolved → owner dropped downstream
 
 

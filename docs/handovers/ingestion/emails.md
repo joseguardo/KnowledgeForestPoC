@@ -73,9 +73,10 @@ aggregation (weights/strength) is also a later step.
 ### Message content (private body)
 
 Each email's subject+body is ingested as a **private `document`** (chunked +
-embedded by `ingest-document`), linked `document --communication_content-->
-communication` (same relationship Affinidad uses for its comms; **was
-`email_content`**). The communication node stays firm-wide and subject-free; the
+embedded by `ingest-document`), linked `document --content_of-->
+communication` (same relationship Affinidad uses for its comms — and for CRM
+notes about entities; **was `email_content`, then `communication_content`**).
+The communication node stays firm-wide and subject-free; the
 body behaves like any other document and the content is participant-private.
 
 Access uses **thread membership**, not per-thread access classes:
@@ -186,7 +187,7 @@ Then on KnowledgeForest (`sjiepibqadbdowcizccw`):
 select metadata->>'direction', count(*) from pointers
 where type='communication' and metadata->>'event_type'='email' group by 1;
 -- private bodies linked to their communications
-select count(*) from edges where relationship_type='communication_content';
+select count(*) from edges where relationship_type='content_of';
 -- thread participants who can read bodies
 select count(*) from thread_membership;
 -- companies / affiliations

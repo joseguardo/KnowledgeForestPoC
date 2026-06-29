@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -43,7 +43,8 @@ def _event(**kw):
     return CalendarEvent(**base)
 
 
-def _wire(monkeypatch, *, events, get_cursor=None, set_cursor=None):
+def _wire(monkeypatch, *, events, cancelled=None, get_cursor=None, set_cursor=None):
+    from pipeline.adapters.calendar import CalendarFetch
     from pipeline.api import ingest as ingest_mod
     from pipeline.main import app
 
@@ -59,7 +60,7 @@ def _wire(monkeypatch, *, events, get_cursor=None, set_cursor=None):
 
     async def fake_fetch(firm, subject, http, *, updated_min=None, max_results=None, sa_info=None):
         fake_fetch.calls.append({"subject": subject, "updated_min": updated_min, "sa_info": sa_info})
-        return events
+        return CalendarFetch(events=list(events), cancelled_ical_uids=list(cancelled or []))
     fake_fetch.calls = []
 
     monkeypatch.setattr(ingest_mod, "fetch_calendar_events", fake_fetch)
@@ -78,6 +79,9 @@ def _wire(monkeypatch, *, events, get_cursor=None, set_cursor=None):
     client.insert_pointer = AsyncMock(side_effect=fake_insert)
     client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
     app.state.client = client
+    # Default http: the PostgREST data-access layer finds nothing to absorb/cancel/
+    # reconcile. Tests exercising those override app.state.http with rows.
+    app.state.http = _mock_http()
     return client, fake_fetch, set_cursor_mock
 
 
@@ -115,8 +119,148 @@ async def test_ingest_calendar_builds_event_graph(async_client, monkeypatch):
     dkw = client.ingest_document.call_args.kwargs
     assert dkw["access_class"] == f"firm:{TENANT}"
     assert dkw["link"]["target_id"] == ev_ck
-    assert dkw["link"]["relationship_type"] == "event_details"
+    assert dkw["link"]["relationship_type"] == "content_of"
     assert dkw["canonical_key_namespace"] == TENANT
+
+
+def _mock_http(get_rows=None):
+    """An AsyncMock http whose verbs return a response with sync raise_for_status /
+    json (matching httpx), for the PostgREST data-access layer event_sync uses."""
+    http = AsyncMock()
+    for verb in ("get", "patch", "delete", "post"):
+        resp = MagicMock()
+        resp.json.return_value = []
+        getattr(http, verb).return_value = resp
+    if get_rows is not None:
+        http.get.return_value.json.return_value = get_rows
+    return http
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_tags_edges_with_calendar_source(async_client, monkeypatch):
+    client, _, _ = _wire(monkeypatch, events=[_event()])
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+    # Every calendar edge is provenance-tagged so reconciliation prunes only its own.
+    assert client.link_pointers.call_args_list
+    assert all(
+        c.kwargs.get("payload") == {"source": "calendar"}
+        for c in client.link_pointers.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_overwrites_and_reconciles_on_merge(async_client, monkeypatch):
+    """A re-ingested (merged) event gets its time/title refreshed and a now-absent
+    calendar-sourced attendee pruned."""
+    from pipeline.main import app
+
+    client, _, _ = _wire(
+        monkeypatch, events=[_event(start="2026-06-25T13:00:00Z", title="Renamed")]
+    )
+    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+
+    async def fake_insert(**kw):
+        status = "merged" if kw["type"] == "event" else "created"
+        return {"status": status, "pointer_id": kw["canonical_key"]}
+
+    client.insert_pointer = AsyncMock(side_effect=fake_insert)
+    # An existing calendar attended edge for someone no longer on the invite.
+    http = _mock_http(get_rows=[{"id": "stale-edge", "source_id": "person::gone@x.com"}])
+    app.state.http = http
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+
+    # overwrite_event PATCHed the event node's new time + title.
+    assert any(
+        ("id", f"eq.{ev_ck}") in list(c.kwargs["params"])
+        and c.kwargs["json"].get("occurred_at") == "2026-06-25T13:00:00Z"
+        and c.kwargs["json"].get("label") == "Renamed"
+        for c in http.patch.call_args_list
+    )
+    # reconcile_attendees deleted the stale calendar-sourced edge.
+    assert any(
+        ("id", "eq.stale-edge") in list(c.kwargs["params"])
+        for c in http.delete.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_absorbs_orphan_note_event(async_client, monkeypatch):
+    """Notes-first: a newly-ingested calendar meeting folds in an orphan note-event
+    for the same meeting (re-points its edges, deletes it)."""
+    from pipeline.main import app
+
+    client, _, _ = _wire(monkeypatch, events=[_event()])  # insert → "created"
+    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    http = _mock_http(get_rows=[
+        {"id": "note-ev", "canonical_key": f"event:{TENANT}:meetingnote:pg-1",
+         "label": "Sync with Poseidon"},
+    ])
+    app.state.http = http
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+
+    # Re-pointed the orphan's edges onto the calendar event and deleted the orphan.
+    assert any(
+        list(c.kwargs["params"]) == [("source_id", "eq.note-ev")]
+        and c.kwargs["json"] == {"source_id": ev_ck}
+        for c in http.patch.call_args_list
+    )
+    assert any(
+        ("id", "eq.note-ev") in list(c.kwargs["params"])
+        for c in http.delete.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_soft_marks_cancelled(async_client, monkeypatch):
+    from pipeline.main import app
+
+    client, _, _ = _wire(monkeypatch, events=[], cancelled=["uid-x@google.com"])
+    ev_ck = f"event:{TENANT}:gcal:uid-x@google.com"
+    http = _mock_http(get_rows=[{"id": ev_ck, "metadata": {"event_type": "meeting"}}])
+    app.state.http = http
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+
+    # Looked the meeting up by its canonical key.
+    assert any(
+        ("canonical_key", f"eq.{ev_ck}") in list(c.kwargs["params"])
+        for c in http.get.call_args_list
+    )
+    # Soft-marked it cancelled (metadata preserved + status set).
+    assert any(
+        c.kwargs.get("json", {}).get("metadata", {}).get("status") == "cancelled"
+        for c in http.patch.call_args_list
+    )
+    # Dropped its calendar-sourced attendance.
+    assert any(
+        ("payload->>source", "eq.calendar") in list(c.kwargs["params"])
+        for c in http.delete.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_calendar_unauthorized_mailbox_degrades_gracefully(async_client, monkeypatch):
+    """An AdapterError fetching one mailbox (e.g. DWD unauthorized) is recorded as a
+    per-run error; the endpoint still returns 200 rather than 500-ing."""
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.errors import AdapterError
+
+    _wire(monkeypatch, events=[_event()])
+
+    async def boom(*a, **k):
+        raise AdapterError("DWD token mint failed for x@nzalpha.com: unauthorized_client")
+
+    monkeypatch.setattr(ingest_mod, "fetch_calendar_events", boom)
+
+    resp = await async_client.post("/api/v1/ingest/calendar", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["errors"], "the unauthorized mailbox should be recorded as an error"
 
 
 @pytest.mark.asyncio

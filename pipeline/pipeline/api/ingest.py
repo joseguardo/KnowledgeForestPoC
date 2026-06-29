@@ -33,6 +33,8 @@ from pipeline.adapters.calendar_entities import (
     event_key as calendar_event_key,
     extract_graph as extract_calendar_graph,
 )
+from pipeline import event_sync
+from pipeline import crm_sync
 from pipeline.adapters.conversation import ConversationAdapter
 from pipeline.adapters.document import DocumentAdapter
 from pipeline.adapters.email_entities import _looks_like_email, extract_graph, message_key
@@ -566,6 +568,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
 
         # Phase A: collect all events for the firm, advancing per-mailbox cursors.
         events = []
+        cancelled_ical_uids: list[str] = []
         cursor_marks: list[tuple[str, str]] = []
         for mailbox in mailboxes:
             if "@" in mailbox:
@@ -576,14 +579,15 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
             if body.since_last:
                 updated_min = await get_cursor(http, cursor_key)
             try:
-                evs = await fetch_calendar_events(
+                fetched = await fetch_calendar_events(
                     firm, mailbox, http, updated_min=updated_min,
                     max_results=body.max_results, sa_info=calendar_sa,
                 )
             except (AdapterError, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
                 continue
-            events.extend(evs)
+            events.extend(fetched.events)
+            cancelled_ical_uids.extend(fetched.cancelled_ical_uids)
             cursor_marks.append((cursor_key, run_started))
 
         # Phase B: deterministic extraction, then write entities + edges.
@@ -595,6 +599,10 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
             name_by_email=name_by_email,
         )
         id_by_key: dict[str, str] = {}
+        # Event nodes that already existed (insert-pointer is first-write-wins):
+        # calendar is the source of truth, so these get their time/title/metadata
+        # refreshed and their attendee set reconciled below.
+        merged_event_keys: set[str] = set()
         for ent in graph.entities:
             idx = len(results) + len(errors)
             try:
@@ -614,9 +622,33 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
             if pid:
                 id_by_key[ent.canonical_key] = pid
                 produced += 1
-                results.append(
-                    EdgeFunctionResult(index=idx, status=resp.get("status", "unknown"), pointer_id=pid)
-                )
+                status = resp.get("status", "unknown")
+                results.append(EdgeFunctionResult(index=idx, status=status, pointer_id=pid))
+                if ent.type == "event" and status == "merged":
+                    merged_event_keys.add(ent.canonical_key)
+                    try:
+                        await event_sync.overwrite_event(
+                            http, pointer_id=pid, occurred_at=ent.occurred_at,
+                            label=ent.label, metadata=ent.metadata or None,
+                        )
+                    except AdapterError as exc:
+                        errors.append(_error_from_exc(len(results) + len(errors), exc))
+                elif ent.type == "event" and status == "created" and ":gcal:" in ent.canonical_key:
+                    # Newly-seen meeting: fold in any note-event ingested for it
+                    # before the calendar caught up (notes-first → one node).
+                    try:
+                        await event_sync.absorb_note_events(
+                            http, tenant_id=firm.tenant_id, calendar_event_id=pid,
+                            scheduled_at=ent.occurred_at, title=ent.label,
+                        )
+                    except AdapterError as exc:
+                        errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+        # Desired attendee set per event, to prune stale calendar-sourced edges.
+        attendees_by_event: dict[str, set[str]] = {}
+        for edge in graph.edges:
+            if edge.rel == "attended":
+                attendees_by_event.setdefault(edge.target, set()).add(edge.source)
 
         for edge in graph.edges:
             src = id_by_key.get(edge.source)
@@ -627,8 +659,38 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                 await client.link_pointers(
                     source_id=src, target_id=tgt,
                     relationship_type=edge.rel, why=edge.why,
+                    payload={"source": "calendar"},
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+        # Reconcile attendees on re-ingested events: drop calendar-sourced
+        # `attended` edges for people no longer invited (note-sourced edges are
+        # left untouched). New attendees were added by the link upsert above.
+        for ev_key in merged_event_keys:
+            ev_pid = id_by_key.get(ev_key)
+            if not ev_pid:
+                continue
+            desired = {
+                id_by_key[p] for p in attendees_by_event.get(ev_key, set())
+                if p in id_by_key
+            }
+            try:
+                await event_sync.reconcile_attendees(
+                    http, event_id=ev_pid, desired_person_ids=desired
+                )
+            except AdapterError as exc:
+                errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+        # Soft-mark meetings cancelled (or declined) since the last run: keep the
+        # node, flag it cancelled, drop its calendar attendance. No-op if we never
+        # ingested it.
+        for ical_uid in cancelled_ical_uids:
+            try:
+                await event_sync.soft_cancel_event(
+                    http, canonical_key=calendar_event_key(firm.tenant_id, ical_uid)
+                )
+            except AdapterError as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
 
         # Phase C: descriptions. One firm-wide document per event with body text
@@ -656,7 +718,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                     canonical_key_namespace=ev.tenant_id,
                     link={
                         "target_id": pid,
-                        "relationship_type": "event_details",
+                        "relationship_type": "content_of",
                         "why": "Description of this calendar event",
                     },
                 )
@@ -721,21 +783,48 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
             **await _load_person_names(http, firm.tenant_id),
             **fetched.team_names,
         }
+        # Calendar is the source of truth: match each note to an already-ingested
+        # calendar meeting and attach to it — notes never create a meeting. A timed
+        # note matches the UTC clock-hour; a date-only note matches the UTC day;
+        # both require a normalized-title match. Unmatched notes are dropped
+        # (calendar is ingested first, so a real meeting is already present).
+        attach_to: dict[str, str] = {}
+        matched: list[MeetingNote] = []
+        for note in notes:
+            if note.is_datetime and note.occurred_at:
+                when, day = note.occurred_at, False           # real datetime → hour
+            elif note.scheduled_at:
+                when, day = note.scheduled_at, False          # trailing ISO in title → hour
+            else:
+                when, day = note.occurred_at, True            # date-only → day + title
+            cal_pid = await event_sync.find_calendar_event(
+                http, tenant_id=firm.tenant_id, scheduled_at=when, title=note.title, day=day,
+            )
+            if cal_pid:
+                attach_to[notes_event_key(firm.tenant_id, note)] = cal_pid
+                matched.append(note)
+
+        # Deterministic extraction over the matched notes only (mirror Gmail).
         graph = extract_notes_graph(
-            notes,
+            matched,
             crm_domains=set(crm_names),
             crm_names=crm_names,
             name_to_domain=build_company_index(crm_names),
             own_domains=fetched.own_domains,
             name_by_email=name_by_email,
         )
-
         # Record attendees/owners dropped for lacking a name (debug log).
         await log_rejections(http, notes=graph.rejections)
 
-        # Phase B: deterministic extraction → entities, then edges (mirror Gmail).
+        # Phase B: write entities, then edges. Event entities are never created by
+        # notes — they resolve to the matched calendar meeting.
         id_by_key: dict[str, str] = {}
         for ent in graph.entities:
+            if ent.type == "event":
+                pid = attach_to.get(ent.canonical_key)
+                if pid:
+                    id_by_key[ent.canonical_key] = pid
+                continue
             idx = len(results) + len(errors)
             try:
                 resp = await client.insert_pointer(
@@ -767,24 +856,30 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
                 await client.link_pointers(
                     source_id=src, target_id=tgt,
                     relationship_type=edge.rel, why=edge.why,
+                    payload={"source": "notes"},
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
 
-        # Phase C: bodies. One document per meeting with a summary, linked to its
-        # event; firm-wide unless Confidential → private class + participant grants.
-        max_edited = _max_iso(since, None)
-        for note in notes:
-            if note.body:
-                idx = len(results) + len(errors)
-                try:
-                    await _ingest_note_body(http, client, note, firm_class_key, user_ids, id_by_key)
-                except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
-                    errors.append(_error_from_exc(idx, exc))
-            max_edited = _max_iso(max_edited, note.last_edited)
+        # Phase C: each matched note's content fields (notes, notion_summary) become
+        # SEPARATE documents linked to the calendar event; firm-wide unless
+        # Confidential → private class + participant grants.
+        for note in matched:
+            idx = len(results) + len(errors)
+            try:
+                await _ingest_note_documents(http, client, note, firm_class_key, user_ids, id_by_key)
+            except (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
+                errors.append(_error_from_exc(idx, exc))
 
-        if body.since_last and max_edited:
-            await set_cursor(http, cursor_key, max_edited)
+        # Advance the cursor past ALL fetched notes (dropped/unmatched included) so
+        # they aren't reprocessed — calendar runs first, so an unmatched note means
+        # there is genuinely no meeting for it.
+        if body.since_last:
+            max_edited = _max_iso(since, None)
+            for note in notes:
+                max_edited = _max_iso(max_edited, note.last_edited)
+            if max_edited:
+                await set_cursor(http, cursor_key, max_edited)
 
     elapsed = int((time.monotonic() - start) * 1000)
     return IngestResponse(
@@ -811,7 +906,7 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
     return max(candidates, key=lambda t: t[0])[1]
 
 
-async def _ingest_note_body(
+async def _ingest_note_documents(
     http,
     client: EdgeFunctionClient,
     note: MeetingNote,
@@ -819,12 +914,15 @@ async def _ingest_note_body(
     user_ids: dict[str, str],
     id_by_key: dict[str, str],
 ) -> None:
-    """Ingest a meeting's summary as a document linked to its event node.
-    Firm-wide (acl = [tenant]) unless Confidential → acl = the owner + attendees
-    who have platform accounts (their uids), so only they can read it."""
+    """Ingest each of a meeting's content fields (e.g. `notes`, `notion_summary`)
+    as its OWN document linked `content_of` to the calendar event. Firm-wide
+    (acl = [tenant]) unless Confidential → acl = the owner + attendees who have
+    platform accounts (their uids), so only they can read it."""
     tenant = note.tenant_id
     start = note.occurred_at or note.last_edited
     event_id = id_by_key.get(notes_event_key(tenant, note))
+    if not event_id:
+        return  # matched notes always resolve to a calendar event; defensive
 
     body_access_class: str | None = None
     principals: list[str] | None = None
@@ -836,25 +934,22 @@ async def _ingest_note_body(
     else:
         body_access_class = firm_class_key  # firm:{tenant} → acl [tenant]
 
-    link = (
-        {
-            "target_id": event_id,
-            "relationship_type": "meeting_notes",
-            "why": "Notes/summary of this meeting",
-        }
-        if event_id
-        else None
-    )
-    await client.ingest_document(
-        title=note.title,
-        content=note.body,
-        occurred_at=start,
-        metadata={"page_id": note.page_id, "confidential": note.confidential},
-        access_class=body_access_class,
-        principals=principals,
-        canonical_key_namespace=tenant,
-        link=link,
-    )
+    for field_name, content in note.documents:
+        await client.ingest_document(
+            title=note.title,
+            content=content,
+            occurred_at=start,
+            metadata={"page_id": note.page_id, "confidential": note.confidential,
+                      "field": field_name},
+            access_class=body_access_class,
+            principals=principals,
+            canonical_key_namespace=tenant,
+            link={
+                "target_id": event_id,
+                "relationship_type": "content_of",
+                "why": f"Meeting {field_name}",
+            },
+        )
 
 
 @router.post("/notion", response_model=IngestResponse)
@@ -1350,6 +1445,30 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
                     client, deal, entity_by_id, _deal_principals(deal)
                 ),
             )
+            # Exit-capture: stage *changes* historize automatically (they arrive as
+            # attribute upserts), but a list *exit* leaves an orphaned attribute and
+            # fires no DELETE. Close those intervals here. Only entities resolved from
+            # this run's source are candidates, so a partial run never fabricates an exit.
+            managed: dict[str, set[str]] = {}
+            for ent in entities:
+                if ent.kind not in ("company", "opportunity"):
+                    continue
+                pid = await resolve(ent.entity_id)
+                if pid:
+                    managed.setdefault(pid, set())
+            for deal in deals:
+                pid = await resolve(deal.entity_id)
+                if not pid or pid not in managed:
+                    continue
+                for (k, _v, _dt) in deal.attributes:
+                    if k.endswith(":Stage"):
+                        managed[pid].add(k)
+            try:
+                await crm_sync.reconcile_list_memberships(
+                    http, tenant_id=firm.tenant_id, managed_keys_by_pointer=managed
+                )
+            except _INGEST_ERRORS as exc:
+                _fail(exc)
 
         if "notes" in objects:
             try:

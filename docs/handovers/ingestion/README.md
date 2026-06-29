@@ -18,6 +18,17 @@ Every adapter normalizes to `NormalizedItem` (`pipeline/pipeline/models.py`) —
 
 **Identity & dedup:** the `insert_pointer_with_dedup` RPC merges on a matching
 `canonical_key`; trigram+embedding similarity only flags lookalikes for review.
+**Person email-overlap merge:** because sources key the same human by different
+addresses (team directory by their kibo address, Affinidad by their primary/nzyme
+address), a `person` insert first folds into any existing person that already
+carries one of its emails (in `metadata.emails`) or is keyed on one — *before*
+name/canonical matching. The survivor keeps its `canonical_key` and unions the
+incoming emails, so the human stays a single node and the merge is durable across
+re-syncs (a source keying by the other address still resolves to the survivor).
+Migration `20260629150000_person_email_overlap_dedup.sql`; only `person` is
+affected (companies stay keyed by tenant+domain). Caveat: a shared/role mailbox
+appearing in two people's email lists could over-merge — keep role inboxes as
+their own nodes.
 **Access:** every row carries `acl uuid[]` — the principals (tenant ids, user
 ids, public sentinel) that may read it — and RLS is `acl && (select
 my_principals())`. People are one **global** `person::{email}` node across firms;

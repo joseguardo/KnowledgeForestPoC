@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from pipeline.adapters.calendar import CalendarEvent, events_from_calendar
+from pipeline.adapters.calendar import (
+    CalendarEvent,
+    CalendarFetch,
+    events_from_calendar,
+)
 from pipeline.config import settings
 
 TENANT = "T1"
@@ -42,8 +46,12 @@ def _item(**kw) -> dict:
     return base
 
 
-def _events(*items: dict) -> list[CalendarEvent]:
+def _fetch(*items: dict) -> CalendarFetch:
     return events_from_calendar(list(items), tenant_id=TENANT, calendar_email=OWNER)
+
+
+def _events(*items: dict) -> list[CalendarEvent]:
+    return _fetch(*items).events
 
 
 def test_parses_core_event_fields():
@@ -73,26 +81,34 @@ def test_attendee_emails_lowercased_and_owner_excluded():
     assert ev.attendees == [("lp@poseidon.vc", "Laura")]
 
 
-def test_skips_cancelled_event():
-    assert _events(_item(status="cancelled")) == []
+def test_cancelled_event_surfaces_ical_uid_for_soft_mark():
+    res = _fetch(_item(status="cancelled"))
+    assert res.events == []
+    # The cancellation is surfaced so an already-ingested node can be soft-marked.
+    assert res.cancelled_ical_uids == ["uid-1@google.com"]
 
 
-def test_skips_all_day_event():
-    assert _events(_item(start={"date": "2026-06-25"}, end={"date": "2026-06-26"})) == []
+def test_skips_all_day_event_without_surfacing_cancellation():
+    res = _fetch(_item(start={"date": "2026-06-25"}, end={"date": "2026-06-26"}))
+    assert res.events == [] and res.cancelled_ical_uids == []
 
 
-def test_skips_when_owner_declined():
+def test_owner_declined_surfaces_ical_uid_for_soft_mark():
     declined = _item(attendees=[
         {"email": OWNER, "self": True, "responseStatus": "declined"},
         {"email": "lp@poseidon.vc", "displayName": "Laura", "responseStatus": "accepted"},
     ])
-    assert _events(declined) == []
+    res = _fetch(declined)
+    # Decline-after-accept retracts a meeting we may already hold.
+    assert res.events == []
+    assert res.cancelled_ical_uids == ["uid-1@google.com"]
 
 
-def test_skips_solo_event_with_no_other_attendees():
-    assert _events(_item(attendees=[
+def test_skips_solo_event_without_surfacing_cancellation():
+    res = _fetch(_item(attendees=[
         {"email": OWNER, "self": True, "responseStatus": "accepted"},
-    ])) == []
+    ]))
+    assert res.events == [] and res.cancelled_ical_uids == []
     # also when attendees is absent entirely (personal block)
     assert _events(_item(attendees=None)) == []
 
@@ -149,9 +165,9 @@ async def test_fetch_events_paginates_and_passes_window(monkeypatch):
     monkeypatch.setattr(cal, "_get", fake_get)
 
     firm = _firm()
-    events = await cal.fetch_events(firm, OWNER, http=AsyncMock())
+    fetched = await cal.fetch_events(firm, OWNER, http=AsyncMock())
 
-    assert {e.ical_uid for e in events} == {"ua", "ub"}
+    assert {e.ical_uid for e in fetched.events} == {"ua", "ub"}
     # primary calendar, expanded recurrences, ordered, with a timeMin window
     assert calls[0]["singleEvents"] == "true"
     assert calls[0]["orderBy"] == "startTime"
@@ -212,6 +228,31 @@ async def test_fetch_events_mints_with_sa_info_override(monkeypatch):
     mint.reset_mock()
     await cal.fetch_events(firm, OWNER, http=AsyncMock())
     assert mint.await_args.args[0] == firm.sa_info
+
+
+@pytest.mark.asyncio
+async def test_mint_token_unauthorized_raises_adapter_error(monkeypatch):
+    """A DWD failure (e.g. SA not authorized for an mailbox's Workspace) surfaces
+    as AdapterError, so the orchestration layer records a per-mailbox error and
+    keeps going instead of 500-ing the whole run."""
+    from google.auth.exceptions import RefreshError
+    from google.oauth2 import service_account
+
+    from pipeline.adapters.gmail import _mint_token
+    from pipeline.errors import AdapterError
+
+    class _Creds:
+        token = None
+
+        def refresh(self, request):
+            raise RefreshError("unauthorized_client")
+
+    monkeypatch.setattr(
+        service_account.Credentials, "from_service_account_info",
+        lambda *a, **k: _Creds(),
+    )
+    with pytest.raises(AdapterError):
+        await _mint_token({"client_email": "x"}, "u@nzalpha.com", "scope")
 
 
 def test_calendar_sa_info_prefers_b64_then_json_then_none(monkeypatch):

@@ -83,9 +83,25 @@ class CalendarEvent:
     recurring_event_id: str | None = None
 
 
+@dataclass
+class CalendarFetch:
+    """Result of reading a calendar window: the events that carry graph signal,
+    plus the iCalUIDs that should be *soft-cancelled* if previously ingested —
+    cancelled tombstones and meetings the owner has now declined (a
+    decline-after-accept should retract a meeting we may already hold). All-day /
+    solo blocks are dropped silently (they never produced a node)."""
+
+    events: list[CalendarEvent]
+    cancelled_ical_uids: list[str]
+
+
 def _attendee_name(att: dict[str, Any]) -> str | None:
     name = (att.get("displayName") or "").strip()
     return name or None
+
+
+def _ical_uid(it: dict[str, Any]) -> str:
+    return (it.get("iCalUID") or it.get("id") or "").strip()
 
 
 def events_from_calendar(
@@ -93,17 +109,21 @@ def events_from_calendar(
     *,
     tenant_id: str,
     calendar_email: str,
-) -> list[CalendarEvent]:
-    """Flatten raw `events.list` items into records, dropping the noise.
+) -> CalendarFetch:
+    """Flatten raw `events.list` items into records, separating cancellations.
 
-    Skips: cancelled events; all-day events (a `start.date` with no `dateTime`);
-    events the owner declined (their `self` attendee `responseStatus == declined`);
-    and solo events with no other human participant. Pure: no run context applied.
+    Kept events skip: all-day events (a `start.date` with no `dateTime`) and solo
+    events with no other human participant. Cancelled tombstones and owner-declined
+    events are not kept either, but their iCalUIDs are returned so the orchestration
+    layer can soft-mark any node we already ingested. Pure: no run context applied.
     """
     owner = calendar_email.strip().lower()
     out: list[CalendarEvent] = []
+    cancelled: list[str] = []
     for it in items:
         if (it.get("status") or "").lower() == "cancelled":
+            if _ical_uid(it):
+                cancelled.append(_ical_uid(it))
             continue
 
         start_obj = it.get("start") or {}
@@ -119,6 +139,9 @@ def events_from_calendar(
             for a in raw_attendees
         )
         if owner_declined:
+            # Decline-after-accept: retract a meeting we may already hold.
+            if _ical_uid(it):
+                cancelled.append(_ical_uid(it))
             continue
 
         # Other human participants: every attendee that isn't the owner or a
@@ -152,7 +175,7 @@ def events_from_calendar(
                 tenant_id=tenant_id,
                 calendar_email=owner,
                 owner_name=owner_name,
-                ical_uid=(it.get("iCalUID") or it.get("id") or "").strip(),
+                ical_uid=_ical_uid(it),
                 event_id=(it.get("id") or "").strip(),
                 title=(it.get("summary") or "").strip() or "(no title)",
                 start=start,
@@ -164,7 +187,7 @@ def events_from_calendar(
                 recurring_event_id=(it.get("recurringEventId") or "").strip() or None,
             )
         )
-    return out
+    return CalendarFetch(events=out, cancelled_ical_uids=cancelled)
 
 
 async def fetch_events(
@@ -175,7 +198,7 @@ async def fetch_events(
     updated_min: str | None = None,
     max_results: int | None = None,
     sa_info: dict[str, Any] | None = None,
-) -> list[CalendarEvent]:
+) -> CalendarFetch:
     """Fetch `subject`'s primary calendar and flatten to records.
 
     Mints a DWD token for the Calendar scope using `sa_info` (the calendar SA)

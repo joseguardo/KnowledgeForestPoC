@@ -254,7 +254,16 @@ async def _mint_token(sa_info: dict[str, Any], subject: str, scopes: str) -> str
     )
 
     def _refresh() -> str:
-        creds.refresh(GoogleAuthRequest())
+        from google.auth.exceptions import GoogleAuthError
+
+        try:
+            creds.refresh(GoogleAuthRequest())
+        except GoogleAuthError as exc:
+            # e.g. unauthorized_client when the SA's domain-wide delegation isn't
+            # authorized for this subject's Workspace/scope. Surface as an
+            # AdapterError so callers record a per-mailbox error and continue
+            # instead of 500-ing the whole firm's run.
+            raise AdapterError(f"DWD token mint failed for {subject}: {exc}")
         return creds.token
 
     return await asyncio.to_thread(_refresh)
