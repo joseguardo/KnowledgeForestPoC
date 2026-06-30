@@ -434,6 +434,54 @@ async def test_ingest_gmail_messages_builds_per_message_entities(async_client, m
 
 
 @pytest.mark.asyncio
+async def test_ingest_gmail_body_acl_includes_mailbox_owner(async_client, monkeypatch):
+    """The body acl always includes the mailbox owner, even when they are not on the
+    visible header (BCC'd, or an external↔external thread in their mailbox). Without
+    that, such bodies would be readable by nobody."""
+    from pipeline.adapters.gmail import EmailMessage
+    from pipeline.api import ingest as ingest_mod
+    from pipeline.main import app
+
+    monkeypatch.setattr(
+        settings, "gmail_firms",
+        json.dumps([{"tenant_id": "T1", "sa_key_b64": _sa_b64(), "mailboxes": ["owner@kiboventures.com"]}]),
+    )
+    msgs = [
+        EmailMessage(
+            tenant_id="T1", mailbox="owner@kiboventures.com", message_id="<b@x>", thread_id="TH2",
+            occurred_at="2026-06-01T10:00:00+00:00", sender=("ext1@ext.com", "Ext One"),
+            to=[("ext2@ext.com", "Ext Two")], cc=[],
+            subject="External thread", body="Body.",
+        ),
+    ]
+
+    async def fake_fetch(self, firm, subject, http, query=None, max_results=None):
+        return MessageFetch(messages=msgs)
+
+    monkeypatch.setattr(GmailAdapter, "fetch_messages", fake_fetch)
+    monkeypatch.setattr(ingest_mod, "_load_company_domains", AsyncMock(return_value={}))
+    # Only the mailbox owner is a platform user; both header parties are external.
+    monkeypatch.setattr(
+        ingest_mod, "resolve_user_ids",
+        AsyncMock(return_value={"owner@kiboventures.com": "uid-owner"}),
+    )
+
+    async def fake_insert(**kw):
+        return {"status": "created", "pointer_id": kw["canonical_key"]}
+
+    client = AsyncMock()
+    client.insert_pointer = AsyncMock(side_effect=fake_insert)
+    client.ingest_document = AsyncMock(return_value={"status": "created", "pointer_id": "doc-1"})
+    app.state.client = client
+
+    resp = await async_client.post("/api/v1/ingest/gmail", json={})
+    assert resp.status_code == 200, resp.text
+    dkw = client.ingest_document.call_args.kwargs
+    # owner is on neither From/To/Cc, yet is granted because it is their mailbox.
+    assert set(dkw["principals"]) == {"uid-owner"}
+
+
+@pytest.mark.asyncio
 async def test_ingest_gmail_messages_skips_body_when_message_merged(async_client, monkeypatch):
     """A message that already exists (insert returns `merged`) does not re-ingest
     its body — avoids re-embedding the second-mailbox copy / since_last overlap."""

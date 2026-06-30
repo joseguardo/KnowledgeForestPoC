@@ -99,7 +99,7 @@ async def test_ingest_calendar_builds_event_graph(async_client, monkeypatch):
     company = f"company::{TENANT}::poseidon.vc"
 
     inserted = {(c.kwargs["type"], c.kwargs["canonical_key"]) for c in client.insert_pointer.call_args_list}
-    assert ("event", ev_ck) in inserted
+    assert ("communication", ev_ck) in inserted
     assert ("person", gp) in inserted
     assert ("person", lp) in inserted
     assert ("company", company) in inserted
@@ -161,7 +161,7 @@ async def test_ingest_calendar_overwrites_and_reconciles_on_merge(async_client, 
     ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
 
     async def fake_insert(**kw):
-        status = "merged" if kw["type"] == "event" else "created"
+        status = "merged" if kw["type"] == "communication" else "created"
         return {"status": status, "pointer_id": kw["canonical_key"]}
 
     client.insert_pointer = AsyncMock(side_effect=fake_insert)
@@ -187,32 +187,16 @@ async def test_ingest_calendar_overwrites_and_reconciles_on_merge(async_client, 
 
 
 @pytest.mark.asyncio
-async def test_ingest_calendar_absorbs_orphan_note_event(async_client, monkeypatch):
-    """Notes-first: a newly-ingested calendar meeting folds in an orphan note-event
-    for the same meeting (re-points its edges, deletes it)."""
-    from pipeline.main import app
-
-    client, _, _ = _wire(monkeypatch, events=[_event()])  # insert → "created"
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
-    http = _mock_http(get_rows=[
-        {"id": "note-ev", "canonical_key": f"event:{TENANT}:meetingnote:pg-1",
-         "label": "Sync with Poseidon"},
-    ])
-    app.state.http = http
-
+async def test_ingest_calendar_skip_documents(async_client, monkeypatch):
+    """With calendar_skip_documents, the slow per-event description phase is skipped
+    (event nodes + edges still written)."""
+    monkeypatch.setattr(settings, "calendar_skip_documents", True, raising=False)
+    client, _, _ = _wire(monkeypatch, events=[_event(description="Agenda for the call.")])
     resp = await async_client.post("/api/v1/ingest/calendar", json={})
     assert resp.status_code == 200, resp.text
-
-    # Re-pointed the orphan's edges onto the calendar event and deleted the orphan.
-    assert any(
-        list(c.kwargs["params"]) == [("source_id", "eq.note-ev")]
-        and c.kwargs["json"] == {"source_id": ev_ck}
-        for c in http.patch.call_args_list
-    )
-    assert any(
-        ("id", "eq.note-ev") in list(c.kwargs["params"])
-        for c in http.delete.call_args_list
-    )
+    client.ingest_document.assert_not_called()
+    # event + persons still inserted
+    assert any(c.kwargs["type"] == "communication" for c in client.insert_pointer.call_args_list)
 
 
 @pytest.mark.asyncio

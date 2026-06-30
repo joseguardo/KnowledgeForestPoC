@@ -22,6 +22,9 @@ _KIBO_EMAILS = {
     "sonia@kiboventures.com", "covadonga@kiboventures.com", "edvinas@kiboventures.com",
     "jma@kiboventures.com", "jordi@kiboventures.com", "aquilino@kiboventures.com",
     "lucia@kiboventures.com",
+    # added 2026-06-30: internal email participants confirmed Kibo
+    "javier@kiboventures.com", "maria@kiboventures.com", "valeria@kiboventures.com",
+    "inma@kiboventures.com", "sunir@kiboventures.com",
 }
 # NOTE: juan@, niklas@, jaaz@kiboventures.com were removed here — they are Kibo
 # people who were wrongly dual-listed, which unioned Nzyme onto every meeting they
@@ -36,6 +39,12 @@ _NZYME_EMAILS = {
     "fernando@kiboventures.com", "gsa@kiboventures.com",
     "ignacio@kiboventures.com", "sakhee.joisher@nzalpha.com",
     "alvaro.fresnillo@nzalpha.com", "jose.guardo@nzyme.com",
+    # added 2026-06-30: internal email participants confirmed Nzyme
+    "gonzalo@kiboventures.com", "laura@kiboventures.com", "alvaro@kiboventures.com",
+    "juancarlos@kiboventures.com", "jgn@kiboventures.com", "mp@kiboventures.com",
+    "joaquin@kiboventures.com", "jaime@kiboventures.com", "jessica@kiboventures.com",
+    "alejandra@kiboventures.com", "matthias.kirsten@nzyme.com",
+    "rodrigo.pintoribeiro@nzyme.com",
 }
 
 

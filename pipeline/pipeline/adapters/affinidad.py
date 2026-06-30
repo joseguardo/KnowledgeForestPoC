@@ -584,8 +584,10 @@ class AffinidadAdapter:
             part_rows = [dict(r) for r in await conn.fetch(
                 "SELECT event_id, entity_type, entity_id, role, response_status FROM event_participants"
             )]
-            # Scope: meetings only this round (the ~29.6k content-less emails are a
-            # separate pass). type='meeting' filters them at the source.
+            # Calendar is the source of truth for meetings and Gmail for emails, so the
+            # CRM connector must NOT re-ingest those interaction types — they would
+            # duplicate the calendar/gmail communications. Pull only the other CRM-only
+            # interaction types (call/message/other). Filtered at the source.
             if since:
                 try:
                     since_dt = datetime.fromisoformat(since)
@@ -594,14 +596,14 @@ class AffinidadAdapter:
                 rows = [dict(r) for r in await conn.fetch(
                     "SELECT id, type, occurred_at, direction, status, subject, body, "
                     "thread_id, source, external_id, metadata FROM events "
-                    "WHERE type='meeting' AND updated_at > $1 ORDER BY occurred_at ASC NULLS LAST LIMIT $2",
+                    "WHERE type NOT IN ('meeting','email') AND updated_at > $1 ORDER BY occurred_at ASC NULLS LAST LIMIT $2",
                     since_dt, cap,
                 )]
             else:
                 rows = [dict(r) for r in await conn.fetch(
                     "SELECT id, type, occurred_at, direction, status, subject, body, "
                     "thread_id, source, external_id, metadata FROM events "
-                    "WHERE type='meeting' ORDER BY occurred_at ASC NULLS LAST LIMIT $1",
+                    "WHERE type NOT IN ('meeting','email') ORDER BY occurred_at ASC NULLS LAST LIMIT $1",
                     cap,
                 )]
         except AdapterError:

@@ -111,7 +111,7 @@ def extract_graph(
         tenant = ev.tenant_id
         event_ck = event_key(tenant, ev.ical_uid)
         add_entity(Entity(
-            event_ck, "event", ev.title, occurred_at=ev.start,
+            event_ck, "communication", ev.title, occurred_at=ev.start,
             metadata={
                 "event_type": "meeting",
                 "location": ev.location,
@@ -130,7 +130,7 @@ def extract_graph(
         if ev.recurring_event_id:
             series_ck = series_key(tenant, ev.recurring_event_id)
             add_entity(Entity(
-                series_ck, "event", ev.title,
+                series_ck, "communication", ev.title,
                 metadata={
                     "event_type": "meeting_series",
                     "provider": "google-calendar",

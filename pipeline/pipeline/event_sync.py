@@ -124,7 +124,7 @@ async def find_calendar_event(
     if lo is None:
         return None
     rows = await sr.select_pointers(
-        http, ptype="event", tenant_id=tenant_id, occurred_from=lo, occurred_to=hi
+        http, ptype="communication", tenant_id=tenant_id, occurred_from=lo, occurred_to=hi
     )
     want = meeting_title_key(title)
     for r in rows:
@@ -155,6 +155,9 @@ async def absorb_note_events(
     lo, hi = _hour_window(scheduled_at)
     if lo is None:
         return []
+    # NB: note-events are type `event` (notes-side marker); calendar meetings are
+    # `communication`. We deliberately query `event` here to find orphan note-events
+    # to absorb — not the calendar meetings themselves (which are skipped via `:gcal`).
     rows = await sr.select_pointers(
         http, ptype="event", tenant_id=tenant_id, occurred_from=lo, occurred_to=hi
     )
@@ -186,7 +189,7 @@ async def soft_cancel_event(
     """Soft-mark a cancelled meeting: keep the node (history/reversible), flag
     `metadata.status="cancelled"` + `cancelled_at`, and drop its calendar-sourced
     attendance edges. No-op (returns False) if the meeting was never ingested."""
-    rows = await sr.select_pointers(http, canonical_key=canonical_key, ptype="event")
+    rows = await sr.select_pointers(http, canonical_key=canonical_key, ptype="communication")
     if not rows:
         return False
     row = rows[0]

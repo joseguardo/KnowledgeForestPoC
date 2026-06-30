@@ -99,4 +99,15 @@ async def resolve_user_ids(http: httpx.AsyncClient) -> dict[str, str]:
         email = (u.get("email") or "").strip().lower()
         if email and u.get("id"):
             mapping[email] = u["id"]
+
+    # Defunct-address aliases: a no-longer-used email is the same person as an active
+    # account, so it resolves to that account's uid (e.g. pepe@ → jma@). This lets the
+    # person's old correspondence be granted to their current user without a separate
+    # account for the dead address. `old:new` pairs from settings.user_email_aliases.
+    for pair in (settings.user_email_aliases or "").split(","):
+        if ":" not in pair:
+            continue
+        old, new = (p.strip().lower() for p in pair.split(":", 1))
+        if old and new in mapping:
+            mapping[old] = mapping[new]
     return mapping

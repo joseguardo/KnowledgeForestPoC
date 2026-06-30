@@ -415,6 +415,7 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
                 await client.link_pointers(
                     source_id=src, target_id=tgt,
                     relationship_type=edge.rel, why=edge.why,
+                    principals=[firm.tenant_id],  # tenant-scope the comm-graph edge
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -429,10 +430,13 @@ async def ingest_gmail(body: GmailRequest, request: Request) -> IngestResponse:
             pid = id_by_key.get(key)
             if not pid or key not in created_messages:
                 continue
+            # Always include the mailbox owner (m.mailbox): the body came from their
+            # mailbox, so they're a participant even when not on the visible header
+            # (e.g. they were BCC'd, or it's an external↔external thread in their box).
             member_uids = sorted({
                 uid for uid in (
                     user_ids.get(a)
-                    for a in {m.sender[0], *(a for a, _ in m.to), *(a for a, _ in m.cc)}
+                    for a in {m.mailbox, m.sender[0], *(a for a, _ in m.to), *(a for a, _ in m.cc)}
                 ) if uid
             })
 
@@ -624,22 +628,12 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                 produced += 1
                 status = resp.get("status", "unknown")
                 results.append(EdgeFunctionResult(index=idx, status=status, pointer_id=pid))
-                if ent.type == "event" and status == "merged":
+                if ent.type == "communication" and status == "merged":
                     merged_event_keys.add(ent.canonical_key)
                     try:
                         await event_sync.overwrite_event(
                             http, pointer_id=pid, occurred_at=ent.occurred_at,
                             label=ent.label, metadata=ent.metadata or None,
-                        )
-                    except AdapterError as exc:
-                        errors.append(_error_from_exc(len(results) + len(errors), exc))
-                elif ent.type == "event" and status == "created" and ":gcal:" in ent.canonical_key:
-                    # Newly-seen meeting: fold in any note-event ingested for it
-                    # before the calendar caught up (notes-first → one node).
-                    try:
-                        await event_sync.absorb_note_events(
-                            http, tenant_id=firm.tenant_id, calendar_event_id=pid,
-                            scheduled_at=ent.occurred_at, title=ent.label,
                         )
                     except AdapterError as exc:
                         errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -660,6 +654,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                     source_id=src, target_id=tgt,
                     relationship_type=edge.rel, why=edge.why,
                     payload={"source": "calendar"},
+                    principals=[firm.tenant_id],  # tenant-scope the comm-graph edge
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -667,7 +662,8 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         # Reconcile attendees on re-ingested events: drop calendar-sourced
         # `attended` edges for people no longer invited (note-sourced edges are
         # left untouched). New attendees were added by the link upsert above.
-        for ev_key in merged_event_keys:
+        # Skipped in backfill mode (one DB round-trip per merged event).
+        for ev_key in [] if settings.calendar_skip_reconcile else merged_event_keys:
             ev_pid = id_by_key.get(ev_key)
             if not ev_pid:
                 continue
@@ -694,9 +690,12 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
 
         # Phase C: descriptions. One firm-wide document per event with body text
-        # (deduped by iCalUID across calendars), linked to its event node.
+        # (deduped by iCalUID across calendars), linked to its event node. Each runs
+        # an embedding, so this is the slow phase — `calendar_skip_documents` skips
+        # it for fast/resilient backfills (event nodes + edges are what matter for
+        # downstream matching; descriptions can be backfilled separately).
         ev_by_key: dict[str, object] = {}
-        for ev in events:
+        for ev in [] if settings.calendar_skip_documents else events:
             if ev.description:
                 ev_by_key.setdefault(calendar_event_key(ev.tenant_id, ev.ical_uid), ev)
         for key, ev in ev_by_key.items():
@@ -857,6 +856,7 @@ async def ingest_notes(body: NotesRequest, request: Request) -> IngestResponse:
                     source_id=src, target_id=tgt,
                     relationship_type=edge.rel, why=edge.why,
                     payload={"source": "notes"},
+                    principals=[firm.tenant_id],  # tenant-scope the comm-graph edge
                 )
             except (EdgeFunctionError, EdgeFunctionTimeout, ValidationError) as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -1234,10 +1234,14 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
     """One-time historical backfill of Kibo's in-house CRM ("Affinidad") into the
     graph. Per firm (tenant): companies/people → pointers, entity_edges → edges,
     list memberships → namespaced company attributes ("deals"), notes → documents
-    (org or author-private), and interactions → event pointers + participant edges
-    with a participant-only body document. Idempotent (canonical-key dedup). Order
-    is entities → edges → deals → notes → events so endpoints exist before linking.
-    `objects` restricts a run to specific types (staged backfill of large events)."""
+    (org or author-private), and CRM-only interactions → communication pointers +
+    participant edges with a participant-only body document. **Meetings and emails
+    are NOT ingested** (Calendar owns meetings, Gmail owns emails) — `fetch_events`
+    filters `type NOT IN ('meeting','email')` so the CRM connector only pulls
+    call/message/other interactions and never duplicates calendar/gmail comms.
+    Idempotent (canonical-key dedup). Order is entities → edges → deals → notes →
+    events so endpoints exist before linking. `objects` restricts a run to specific
+    types."""
     start = time.monotonic()
     http = request.app.state.http
     client: EdgeFunctionClient = request.app.state.client

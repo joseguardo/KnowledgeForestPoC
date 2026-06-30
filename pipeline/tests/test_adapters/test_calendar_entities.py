@@ -49,7 +49,7 @@ def test_builds_event_node_with_metadata():
     ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
     assert ev_ck == event_key(TENANT, "uid-1@google.com")
     ev = ents[ev_ck]
-    assert ev.type == "event"
+    assert ev.type == "communication"
     assert ev.label == "Sync with Poseidon"
     assert ev.occurred_at == "2026-06-25T10:00:00Z"
     assert ev.metadata["event_type"] == "meeting"
@@ -107,7 +107,7 @@ def test_resolves_names_from_directory_then_email_heuristic():
 
 def test_one_time_event_is_tagged_not_recurring():
     g = _graph(_event())  # recurring_event_id=None
-    ev = next(e for e in g.entities if e.type == "event")
+    ev = next(e for e in g.entities if e.type == "communication")
     assert ev.metadata["is_recurring"] is False
     assert ev.metadata["series_id"] is None
     # no series node, no instance_of edge
@@ -125,7 +125,7 @@ def test_recurring_event_tagged_and_linked_to_series():
     assert ev.metadata["series_id"] == "series-xyz"
 
     series = next(e for e in g.entities if e.canonical_key == series_ck)
-    assert series.type == "event"
+    assert series.type == "communication"
     assert series.metadata["event_type"] == "meeting_series"
     assert series.label == "Sync with Poseidon"
 
@@ -140,7 +140,7 @@ def test_recurring_occurrences_share_one_series_node():
     )
     series_nodes = [e for e in g.entities if "gcal-series" in e.canonical_key]
     assert len(series_nodes) == 1                       # two occurrences → one series
-    occ = [e for e in g.entities if e.type == "event" and "gcal-series" not in e.canonical_key]
+    occ = [e for e in g.entities if e.type == "communication" and "gcal-series" not in e.canonical_key]
     assert len(occ) == 2                                # two distinct occurrence nodes
     instance_edges = [e for e in g.edges if e.rel == "instance_of"]
     assert len(instance_edges) == 2                     # each occurrence -instance_of-> series
@@ -156,7 +156,7 @@ def test_same_event_on_two_calendars_dedups_by_ical_uid():
                      attendees=[("gp@kiboventures.com", "Guillermo Puebla")])
     g = _graph(from_gp, from_lp)
 
-    events = [e for e in g.entities if e.type == "event"]
+    events = [e for e in g.entities if e.type == "communication"]
     assert len(events) == 1
 
     ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"

@@ -119,7 +119,9 @@ async def test_find_calendar_event_matches_same_hour_and_title():
     # Queried the clock-hour window in UTC (09:00–10:00 for 11:45+02:00).
     _, gkw = http.get.call_args
     params = list(gkw["params"])
-    assert ("type", "eq.event") in params
+    # Calendar meetings are now type=communication (the `:gcal:` canonical-key still
+    # discriminates them from email/CRM communications in the same window).
+    assert ("type", "eq.communication") in params
     assert ("acl", "cs.{T1}") in params
     assert any(k == "occurred_at" and v.startswith("gte.2026-06-19T09:00:00") for k, v in params)
     assert any(k == "occurred_at" and v.startswith("lte.2026-06-19T09:59:59") for k, v in params)

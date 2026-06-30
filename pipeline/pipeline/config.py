@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     # Per-calendar caps: events fetched per run, and events.list pagination bound.
     calendar_max_results: int = 250
     calendar_max_pages: int = 20
+    # Skip the per-event description-document phase (each runs an embedding — the
+    # slow part). For fast/resilient backfills where only the event graph matters.
+    calendar_skip_documents: bool = False
+    # Skip per-event attendee reconciliation (a DB round-trip per merged event).
+    # For backfills/initial loads where there's no prior attendee state to prune.
+    calendar_skip_reconcile: bool = False
 
     # Notes connector (multi-tenant; reads meeting notes from a *source* Supabase
     # project over a direct Postgres connection using a least-privilege read-only
@@ -181,6 +187,11 @@ class Settings(BaseSettings):
     # Comma-separated email domains allowed to authenticate via the MCP server
     # (defence-in-depth, checked at the Supabase callback and per request).
     mcp_allowed_email_domains: str = "kiboventures.com,nzalpha.com,nzyme.com"
+    # Defunct-address aliases: comma-separated `old:new` email pairs. An out-of-use
+    # address is mapped to the active account of the same person in resolve_user_ids,
+    # so their old correspondence is granted to that person's current user. The old
+    # address has no account of its own (e.g. pepe@ is the same person as jma@).
+    user_email_aliases: str = "pepe@kiboventures.com:jma@kiboventures.com"
     # Optional override for email→tenant auto-assignment (defaults are baked into
     # mcp_server/tenant_map.py). JSON array: [{tenant_id, domains[], emails[]}].
     # On MCP login the user is auto-added to tenant_members for their resolved

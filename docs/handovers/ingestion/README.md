@@ -45,7 +45,13 @@ cleanup migration.)
 - **Notes** — `meeting_transcripts` from a source Supabase (`adapters/notes.py`).
   See [notes.md](notes.md).
 - **Affinidad** — Kibo's in-house CRM Postgres (`adapters/affinidad.py`); the
-  authority on companies (domains + names).
+  authority on companies (domains + names), people, opportunities, list
+  memberships (deals) and notes. **Does NOT ingest meetings or emails** — Calendar
+  is the source of truth for meetings and Gmail for emails, so the CRM connector
+  skips those interaction types (`fetch_events` filters `type NOT IN
+  ('meeting','email')`) to avoid duplicate communication nodes. (The ~4.8k calendar
+  meetings that the CRM had previously double-created were merged onto their
+  Google-Calendar nodes, tagged `metadata.merged_affinity_key`, on 2026-06-30.)
 - **Document / Web / Conversation / Structured** — single documents or explicit
   pointers (`adapters/{document,web,conversation,structured}.py`).
 

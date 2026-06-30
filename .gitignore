@@ -11,4 +11,4 @@ __pycache__
 scripts/calendar/OAuth.json
 scripts/calendar/service-account.json
 scripts/calendar/token.pickle
-*.pickle
+*.pickle__pycache__/
