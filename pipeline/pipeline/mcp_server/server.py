@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -163,11 +164,30 @@ def register_mcp_routes(app: FastAPI) -> None:
     app.mount(MOUNT_PATH, asgi)
 
 
+async def _warm_docling() -> None:
+    """Best-effort warmup of the Docling converter singleton at server boot.
+
+    Runs the (slow, ~4 s, possibly model-downloading) build off the event loop so
+    boot isn't blocked, and swallows any error (e.g. docling not installed) — the
+    fetch_document tool still works, just paying the build cost lazily on first use.
+    """
+    from pipeline.adapters.docling_extract.converter import warm_converter
+
+    try:
+        await asyncio.to_thread(warm_converter)
+        log.info("docling converter warmed at startup")
+    except Exception as exc:  # noqa: BLE001 — warmup is best-effort, never crash boot
+        log.warning("docling converter warmup failed (will build lazily): %s", exc)
+
+
 @asynccontextmanager
 async def mcp_lifespan():
     """Run the streamable-HTTP transport's session manager. Mounted sub-apps
     don't run their own lifespan, so the parent app must enter this."""
     build_mcp_asgi_app()  # ensure session_manager exists
+    # Warm the Docling converter in the background so the model load (~4 s) is paid
+    # once at boot, not on the first fetch_document call.
+    asyncio.create_task(_warm_docling())
     async with mcp.session_manager.run():
         try:
             yield

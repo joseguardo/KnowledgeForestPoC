@@ -13,8 +13,10 @@ from pipeline.models import DocumentRequest, LinkSpec, NormalizedItem
 
 
 # Binary Office formats we can't yet parse to text — recorded as placeholder nodes
-# rather than UTF-8-decoded into gibberish.
-_BINARY_DOC_EXTS = {".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
+# rather than UTF-8-decoded into gibberish. Excel/Word are handled separately
+# (openpyxl / python-docx); legacy .doc/.ppt(x) have no parser wired yet.
+_BINARY_DOC_EXTS = {".doc", ".pptx", ".ppt"}
+_EXCEL_EXTS = {".xlsx", ".xlsm"}
 
 
 class DocumentAdapter:
@@ -57,6 +59,10 @@ class DocumentAdapter:
         elif ext in (".md", ".txt", ".markdown"):
             content = data.decode("utf-8", errors="replace")
             title = _title_from_markdown(content) or Path(filename).stem
+        elif ext in _EXCEL_EXTS:
+            title, content = _extract_xlsx(filename, data)
+        elif ext == ".docx":
+            title, content = _extract_docx(filename, data)
         elif ext in _BINARY_DOC_EXTS:
             # Binary Office formats: decoding as UTF-8 yields gibberish and no
             # parser is wired yet. Record a clean placeholder so the document is
@@ -102,6 +108,64 @@ def _extract_pdf(filename: str, data: bytes) -> tuple[str, str]:
         raise AdapterError(f"PDF '{filename}' contains no extractable text")
 
     return title, "\n\n".join(pages)
+
+
+def _extract_xlsx(filename: str, data: bytes) -> tuple[str, str]:
+    """Flatten a workbook to text: one block per sheet, each non-empty row as a
+    pipe-joined line. Uses cached cell values (data_only) so formulas read as
+    their last-computed result, and read_only/streaming mode to bound memory."""
+    import io
+
+    import openpyxl
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    except Exception as exc:  # noqa: BLE001 — surface a clean adapter error
+        raise AdapterError(f"Failed to open workbook '{filename}': {exc}") from exc
+
+    blocks: list[str] = []
+    for ws in wb.worksheets:
+        lines: list[str] = []
+        for row in ws.iter_rows(values_only=True):
+            cells = ["" if v is None else str(v) for v in row]
+            line = " | ".join(cells).strip(" |")
+            if line:
+                lines.append(line)
+        if lines:
+            blocks.append(f"## Sheet: {ws.title}\n" + "\n".join(lines))
+    wb.close()
+
+    if not blocks:
+        raise AdapterError(f"Workbook '{filename}' contains no readable cells")
+    return Path(filename).stem, "\n\n".join(blocks)
+
+
+def _extract_docx(filename: str, data: bytes) -> tuple[str, str]:
+    """Extract a Word document to text: body paragraphs plus table cells, in
+    document order. Uses the docx core-properties title when present, else the
+    filename stem."""
+    import io
+
+    import docx
+
+    try:
+        doc = docx.Document(io.BytesIO(data))
+    except Exception as exc:  # noqa: BLE001 — surface a clean adapter error
+        raise AdapterError(f"Failed to open Word document '{filename}': {exc}") from exc
+
+    parts: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            line = " | ".join(cells).strip(" |")
+            if line:
+                parts.append(line)
+
+    if not parts:
+        raise AdapterError(f"Word document '{filename}' contains no readable text")
+
+    title = (doc.core_properties.title or "").strip() or Path(filename).stem
+    return title, "\n".join(parts)
 
 
 def _extract_email(data: bytes) -> tuple[str, str, str | None]:

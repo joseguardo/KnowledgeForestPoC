@@ -1,0 +1,23 @@
+{
+  "source": "kf_ingest-sample",
+  "items": [
+    {
+      "label": "Acme Robotics",
+      "type": "company",
+      "canonical_key": "company::kf-ingest-sample::acme-robotics",
+      "metadata": { "website": "https://acme-robotics.example" },
+      "attributes": [
+        { "key": "sector", "value": "Industrial Automation", "data_type": "string" },
+        { "key": "hq_country", "value": "Spain", "data_type": "string" }
+      ]
+    },
+    {
+      "label": "Jane Doe",
+      "type": "person",
+      "canonical_key": "person::kf-ingest-sample::jane-doe",
+      "attributes": [
+        { "key": "role", "value": "CEO", "data_type": "string" }
+      ]
+    }
+  ]
+}

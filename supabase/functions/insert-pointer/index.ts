@@ -118,7 +118,11 @@ Deno.serve(async (req: Request) => {
       const attrRows = body.attributes.map((attr, i) => ({
         pointer_id: result.pointer_id,
         key: attr.key,
-        value: typeof attr.value === "string" ? JSON.stringify(attr.value) : attr.value,
+        // Store the value as-is: the client serializes it into the jsonb column,
+        // so a JS string "EUR" becomes the jsonb string "EUR". (Previously this
+        // JSON.stringify'd strings first, double-encoding them as "\"EUR\"" and
+        // breaking exact-match attribute filters.)
+        value: attr.value,
         data_type: attr.data_type || "string",
         sort_order: attr.sort_order ?? i,
         source: attr.source || "api",

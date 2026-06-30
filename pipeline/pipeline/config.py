@@ -183,7 +183,7 @@ class Settings(BaseSettings):
     # OAuth 2.1 Authorization Server; Supabase (Google provider) is the IdP and
     # the tokens we hand clients ARE Supabase JWTs. See
     # pipeline/pipeline/mcp_server/.
-    mcp_public_base_url: str = "http://localhost:8000"
+    mcp_public_base_url: str = "http://localhost:8080"
     # Comma-separated email domains allowed to authenticate via the MCP server
     # (defence-in-depth, checked at the Supabase callback and per request).
     mcp_allowed_email_domains: str = "kiboventures.com,nzalpha.com,nzyme.com"
@@ -197,6 +197,38 @@ class Settings(BaseSettings):
     # On MCP login the user is auto-added to tenant_members for their resolved
     # tenant (explicit email list wins over domain).
     mcp_tenant_firms: str | None = None
+
+    # SharePoint / Microsoft Graph (client-credentials app, Sites.Read.All).
+    # Used by the MCP `fetch_document` tool to download Portfolio documents.
+    azure_tenant_id: str | None = None
+    azure_client_id: str | None = None
+    azure_client_secret: str | None = None
+    # fetch_document is scoped EXCLUSIVELY to the Portfolio folder. Two guards:
+    #   1. the request's drive_id must equal this drive (the Kibo "Company" site's
+    #      default document library), and
+    #   2. the item's parent path must sit under this root folder.
+    # Defaults are the live Kibo values; override via env if the library moves.
+    sharepoint_portfolio_drive_id: str = (
+        "b!cva5DQQ6KkiKJYBnrov9eB6Iq4NKHeJHoz03P-cgbz0slpH6Isr3RJEpA1_012eb"
+    )
+    sharepoint_portfolio_root: str = "02_Portfolio"
+
+    # Docling document parsing (MCP fetch_document). The tool converts PDFs/Word/
+    # PowerPoint/Excel to markdown + financial facts via Docling.
+    # Confidence gate floor; conversions below this grade are rejected
+    # (POOR|FAIR|GOOD|EXCELLENT).
+    docling_min_grade: str = "GOOD"
+    # Hard per-file page cap (conversion runs ~1.4–4.5s/page).
+    docling_max_pages: int = 200
+    # OCR off by default — Portfolio docs are born-digital and OCR is ~30s/page.
+    docling_do_ocr: bool = False
+    # Accelerator threads. None → use os.cpu_count() at converter-build time
+    # (resolved by the converter agent, not here).
+    docling_num_threads: int | None = None
+    # Cap on markdown chars returned inline over MCP.
+    docling_markdown_inline_cap: int = 100_000
+    # Cap on financial facts returned inline over MCP.
+    docling_facts_inline_cap: int = 200
 
     model_config = SettingsConfigDict(
         env_file=".env",

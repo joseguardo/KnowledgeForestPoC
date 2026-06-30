@@ -1,5 +1,5 @@
 /**
- * Client for the backend ingestion pipeline (FastAPI service, default :8000).
+ * Client for the backend ingestion pipeline (FastAPI service, default :8080).
  *
  * One function per source type plus a health check. Every ingest endpoint
  * returns the same envelope:
@@ -13,7 +13,7 @@
  */
 
 const PIPELINE_URL =
-  import.meta.env.VITE_PIPELINE_URL || "http://localhost:8000";
+  import.meta.env.VITE_PIPELINE_URL || "http://localhost:8080";
 
 const BASE = `${PIPELINE_URL}/api/v1`;
 
@@ -92,6 +92,15 @@ export function ingestStructured(body) {
 /** POST /api/v1/ingest/web. */
 export function ingestWeb(body) {
   return postJSON("/ingest/web", body);
+}
+
+/**
+ * POST /api/v1/ingest/naluat. Triggers the Naluat fund-ledger ingest
+ * (companies + transaction events + fund pointers + edges). Body accepts
+ * { source_path?, dry_run? }; pass {} to run with defaults.
+ */
+export function ingestNaluat(body) {
+  return postJSON("/ingest/naluat", body || {});
 }
 
 /** POST /api/v1/ingest/conversation. */

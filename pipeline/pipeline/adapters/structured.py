@@ -7,7 +7,7 @@ VALID_POINTER_TYPES = {
     "company", "person", "sector", "geography", "regulation",
     "document", "timeseries", "agent", "skill", "tool",
     "flow", "component", "architecture", "best_practice", "meta", "event",
-    "message", "communication",
+    "message", "communication", "fund", "folder",
 }
 
 

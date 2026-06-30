@@ -25,6 +25,11 @@ from pipeline.adapters.affinidad import (
     load_affinidad_firms,
 )
 from pipeline.mcp_server.tenant_map import resolve_tenants
+from pipeline.adapters.naluat import (
+    KIBO_TENANT,
+    SOURCE as NALUAT_SOURCE,
+    build_model as build_naluat_model,
+)
 from pipeline.adapters.calendar import (
     _calendar_sa_info,
     fetch_events as fetch_calendar_events,
@@ -89,6 +94,7 @@ from pipeline.models import (
     IngestError,
     IngestResponse,
     LinkSpec,
+    NaluatRequest,
     NotesRequest,
     NotionRequest,
     StructuredRequest,
@@ -1499,6 +1505,179 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
     elapsed = int((time.monotonic() - start) * 1000)
     return IngestResponse(
         source_type="affinidad",
+        items_produced=produced,
+        results=results,
+        errors=errors,
+        duration_ms=elapsed,
+    )
+
+
+# ── Naluat (Kibo's fund ledger) ─────────────────────────────────────
+
+
+def _naluat_attr_dicts(attrs) -> list[dict]:
+    """(key, value, data_type) tuples → insert-pointer/ingest-batch attribute
+    rows, all stamped source="Naluat"."""
+    return [
+        {"key": k, "value": v, "data_type": dt, "source": NALUAT_SOURCE}
+        for (k, v, dt) in attrs
+    ]
+
+
+@router.post("/naluat", response_model=IngestResponse)
+async def ingest_naluat(body: NaluatRequest, request: Request) -> IngestResponse:
+    """Ingest Kibo's Naluat fund ledger into the graph. Funds → `fund` pointers,
+    companies → `company` pointers (12 merge into existing, 38 new), each of the
+    347 transaction rows → an `event` pointer, then edges company —part_of→ fund,
+    event —transaction_of→ company, event —booked_to→ fund (with rich payloads).
+    Everything is Kibo-only (access_class firm:<kibo>) and source="Naluat".
+    Idempotent: pointers dedup by canonical_key, events keyed by source row id,
+    duplicate edges (409) are ignored. `dry_run=True` parses and returns counts
+    without any edge-function call / network write."""
+    start = time.monotonic()
+    model = build_naluat_model(body.source_path)
+
+    if body.dry_run:
+        c = model.counts()
+        elapsed = int((time.monotonic() - start) * 1000)
+        return IngestResponse(
+            source_type="naluat",
+            items_produced=(
+                c["funds"] + len(model.companies) + c["events"] + c["edges"]
+            ),
+            results=[
+                EdgeFunctionResult(index=0, status="dry_run", detail=c),
+            ],
+            errors=[],
+            duration_ms=elapsed,
+        )
+
+    http = request.app.state.http
+    client: EdgeFunctionClient = request.app.state.client
+    firm_class_key = f"firm:{KIBO_TENANT}"
+
+    results: list[EdgeFunctionResult] = []
+    errors: list[IngestError] = []
+    produced = 0
+    # canonical_key → pointer id (funds, companies, events) for edge linking.
+    id_by_key: dict[str, str] = {}
+
+    def _ok(resp: dict | None) -> None:
+        nonlocal produced
+        produced += 1
+        results.append(
+            EdgeFunctionResult(
+                index=len(results) + len(errors),
+                status=(resp or {}).get("status", "unknown"),
+                pointer_id=(resp or {}).get("pointer_id"),
+                detail=resp,
+            )
+        )
+
+    def _fail(exc: Exception) -> None:
+        errors.append(_error_from_exc(len(results) + len(errors), exc))
+
+    async def _resolve(canonical_key: str) -> str | None:
+        if canonical_key in id_by_key:
+            return id_by_key[canonical_key]
+        pid = await resolve_pointer_id(http, canonical_key)
+        if pid:
+            id_by_key[canonical_key] = pid
+        return pid
+
+    # 1) Funds → `fund` pointers.
+    for fund in model.funds:
+        try:
+            resp = await client.insert_pointer(
+                label=fund.name,
+                type="fund",
+                canonical_key=fund.canonical_key,
+                metadata={"source": NALUAT_SOURCE},
+                access_class=firm_class_key,
+                attributes=_naluat_attr_dicts(fund.attributes) or None,
+            )
+            pid = resp.get("pointer_id")
+            if pid:
+                id_by_key[fund.canonical_key] = pid
+            _ok(resp)
+        except _INGEST_ERRORS as exc:
+            _fail(exc)
+
+    # 2) Companies → `company` pointers (existing reuse-key=merge, new=create).
+    for comp in model.companies:
+        try:
+            resp = await client.insert_pointer(
+                label=comp.name,
+                type="company",
+                canonical_key=comp.canonical_key,
+                metadata={"source": NALUAT_SOURCE},
+                access_class=firm_class_key,
+                attributes=_naluat_attr_dicts(comp.attributes) or None,
+            )
+            pid = resp.get("pointer_id")
+            if pid:
+                id_by_key[comp.canonical_key] = pid
+            _ok(resp)
+        except _INGEST_ERRORS as exc:
+            _fail(exc)
+
+    # 3) Events → `event` pointers via ingest_batch (batches ≤ 50).
+    batch_size = 50
+    for offset in range(0, len(model.events), batch_size):
+        chunk = model.events[offset:offset + batch_size]
+        items = [
+            {
+                "label": ev.label,
+                "type": "event",
+                "canonical_key": ev.canonical_key,
+                "metadata": {"source": NALUAT_SOURCE},
+                "occurred_at": ev.occurred_at,
+                "attributes": _naluat_attr_dicts(ev.attributes),
+            }
+            for ev in chunk
+        ]
+        try:
+            resp = await client.ingest_batch(
+                items=items,
+                source=NALUAT_SOURCE,
+                access_class=firm_class_key,
+            )
+            for entry in resp.get("results", []):
+                idx = entry.get("index")
+                pid = entry.get("pointer_id")
+                if isinstance(idx, int) and 0 <= idx < len(chunk) and pid:
+                    id_by_key[chunk[idx].canonical_key] = pid
+                _ok(entry)
+        except _INGEST_ERRORS as exc:
+            _fail(exc)
+
+    # 4) Edges (part_of, transaction_of, booked_to). Ignore 409 (dup) for
+    # idempotency; resolve any missing endpoint id via canonical_key lookup.
+    for edge in model.edges:
+        try:
+            src = await _resolve(edge.source_key)
+            tgt = await _resolve(edge.target_key)
+            if not src or not tgt:
+                continue
+            resp = await client.link_pointers(
+                source_id=src,
+                target_id=tgt,
+                relationship_type=edge.relationship_type,
+                why=edge.why,
+                payload=edge.payload or None,
+                principals=[KIBO_TENANT],
+            )
+            _ok(resp)
+        except EdgeFunctionError as exc:
+            if exc.status_code == 409:
+                continue  # duplicate edge — idempotent re-run
+            _fail(exc)
+        except _INGEST_ERRORS as exc:
+            _fail(exc)
+
+    elapsed = int((time.monotonic() - start) * 1000)
+    return IngestResponse(
+        source_type="naluat",
         items_produced=produced,
         results=results,
         errors=errors,

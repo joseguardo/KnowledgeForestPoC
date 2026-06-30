@@ -6,7 +6,18 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const SCHEMA_CONTEXT = `
+// The POINTER TYPES / EDGE TYPES lines are injected at runtime from the live DB
+// (see buildSchemaContext) so the planner prompt always reflects the types and
+// edges that actually exist — new pointer types (e.g. fund) or edge types (e.g.
+// transaction_of / booked_to) appear automatically with no manual upkeep. The
+// constants below are only a fallback if the lookup fails.
+const FALLBACK_POINTER_TYPES =
+  "company, person, sector, geography, regulation, document, timeseries, agent, skill, tool, flow, component, architecture, best_practice, meta, event, fund";
+const FALLBACK_EDGE_TYPES =
+  "primary_sector, ceo, competitor, hq_location, jurisdiction, related, uses_skill, uses_tool, uses_agent, triggers, part_of, transaction_of, booked_to, guides, follows, ensures_compliance, dispatches, executes, routes, routed_through, connects_to, powers, contains, accessed_via, triggered_by, used_by, connects";
+
+function schemaContextFor(pointerTypes: string, edgeTypes: string): string {
+  return `
 You are a query planner for a knowledge graph with hierarchy-aware retrieval.
 
 The system has 3 retrieval layers:
@@ -22,8 +33,10 @@ Additional:
   traverse_graph(start_ids, edge_types?, direction?, target_type?, depth?)
   get_pointer_subgraph(pointer_id)
 
-POINTER TYPES: company, person, sector, geography, regulation, document, timeseries, agent, skill, tool, flow, component, architecture, best_practice, meta
-EDGE TYPES: primary_sector, ceo, competitor, hq_location, jurisdiction, related, uses_skill, uses_tool, uses_agent, triggers, part_of, guides, follows, ensures_compliance, dispatches, executes, routes, routed_through, connects_to, powers, contains, accessed_via, triggered_by, used_by, connects
+POINTER TYPES: ${pointerTypes}
+EDGE TYPES: ${edgeTypes}
+
+FUND / PORTFOLIO (Naluat ledger): fund pointers are investment funds. company —part_of→ fund (portfolio membership); each transaction is an event pointer with event —transaction_of→ company and event —booked_to→ fund (edge payload carries {amount,currency,transaction_type,company,fund,date}). To list/total a fund's transactions, traverse inbound booked_to from the fund (or read the fund's naluat_invested_by_currency attribute). Company rollups: naluat_status, naluat_invested_by_currency, naluat_realized_by_currency, naluat_current_value_by_currency, naluat_moic, naluat_valuation_series.
 
 RULES:
 1. Prefer hierarchy_search as first step — it returns attributes inline.
@@ -33,6 +46,33 @@ RULES:
 5. Do NOT add type_filter unless you are confident it won't exclude relevant results. When in doubt, omit it.
 6. Output ONLY valid JSON. 1-3 steps max.
 `;
+}
+
+// Cached for the lifetime of the warm instance — type/edge vocab changes rarely
+// and is schema (not row) data, so we enumerate it with the service role (which
+// sees every type, even those only present in access-restricted rows) while the
+// actual query EXECUTION still runs under the caller's RLS. Any failure falls
+// back to the static lists above, so the planner never breaks.
+let _schemaContextCache: string | null = null;
+async function buildSchemaContext(schemaClient: any): Promise<string> {
+  if (_schemaContextCache) return _schemaContextCache;
+  let pt = FALLBACK_POINTER_TYPES;
+  let et = FALLBACK_EDGE_TYPES;
+  try {
+    const [pRes, eRes] = await Promise.all([
+      schemaClient.from("pointers").select("type"),
+      schemaClient.from("edges").select("relationship_type"),
+    ]);
+    const ptList = [...new Set((pRes.data || []).map((r: any) => r.type).filter(Boolean))].sort();
+    const etList = [...new Set((eRes.data || []).map((r: any) => r.relationship_type).filter(Boolean))].sort();
+    if (ptList.length) pt = ptList.join(", ");
+    if (etList.length) et = etList.join(", ");
+  } catch (_e) {
+    // keep fallbacks
+  }
+  _schemaContextCache = schemaContextFor(pt, et);
+  return _schemaContextCache;
+}
 
 const PLAN_EXAMPLE = `
 Examples:
@@ -72,7 +112,7 @@ async function getEmbedding(text: string): Promise<number[] | null> {
   } catch { return null; }
 }
 
-async function generatePlan(query: string, regexHints: string[], semanticMatches: any[]): Promise<any> {
+async function generatePlan(query: string, regexHints: string[], semanticMatches: any[], schemaContext: string): Promise<any> {
   const openaiKey = Deno.env.get("OPENAI_API_KEY");
   if (!openaiKey) {
     return { steps: [{ action: "hierarchy_search", query }] };
@@ -104,7 +144,7 @@ async function generatePlan(query: string, regexHints: string[], semanticMatches
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: SCHEMA_CONTEXT + PLAN_EXAMPLE },
+          { role: "system", content: schemaContext + PLAN_EXAMPLE },
           { role: "user", content: userMessage },
         ],
         temperature: 0.1,
@@ -262,6 +302,12 @@ Deno.serve(async (req: Request) => {
     const supabase = createClient(supabaseUrl, anonKey, {
       global: { headers: { Authorization: authHeader } },
     });
+    // Separate client used ONLY to enumerate the live pointer/edge types for the
+    // planner prompt (schema metadata, not row data). Uses the service role so
+    // the type list is complete even when the caller is low-clearance; query
+    // execution below still runs under `supabase` (the caller's RLS).
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const schemaClient = serviceKey ? createClient(supabaseUrl, serviceKey) : supabase;
 
     const body: QueryRequest = await req.json();
     if (!body.query?.trim()) {
@@ -285,8 +331,11 @@ Deno.serve(async (req: Request) => {
     const regexHints: string[] = queryContext?.regex_hints || [];
     const semanticMatches: any[] = queryContext?.semantic_matches || [];
 
-    // Step 2: Generate plan (with both hint types injected)
-    const plan = await generatePlan(body.query, regexHints, semanticMatches);
+    // Step 2: Generate plan (with both hint types injected). The schema context
+    // (valid pointer/edge types) is fetched live from the DB so the prompt always
+    // reflects what actually exists.
+    const schemaContext = await buildSchemaContext(schemaClient);
+    const plan = await generatePlan(body.query, regexHints, semanticMatches, schemaContext);
 
     // Step 3: Execute plan (runs under the caller's RLS)
     const results = await executePlan(plan, supabase, tenantId, queryEmbedding);

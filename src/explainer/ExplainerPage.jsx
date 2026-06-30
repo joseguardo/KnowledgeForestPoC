@@ -1865,7 +1865,7 @@ function DupeSlider({ onWrite }) {
 
 /* ── Two doors: real agent + real deterministic search ────────────── */
 
-const SEARCH_TYPES = ["company", "person", "sector", "geography", "regulation", "document", "any"];
+const SEARCH_TYPES = ["company", "person", "sector", "geography", "regulation", "document", "event", "fund", "any"];
 
 function formatEventDate(iso) {
   if (!iso) return null;

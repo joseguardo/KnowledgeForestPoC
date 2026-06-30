@@ -11,4 +11,8 @@ __pycache__
 scripts/calendar/OAuth.json
 scripts/calendar/service-account.json
 scripts/calendar/token.pickle
-*.pickle__pycache__/
+*.pickle
+
+docs/
+downloads/
+afinidad_export/

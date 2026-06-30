@@ -134,6 +134,14 @@ class AffinidadRequest(BaseModel):
     objects: list[str] | None = None
 
 
+class NaluatRequest(BaseModel):
+    # Path to the exported ledger; omit to use the repo's naluat_neo.json.
+    source_path: str | None = None
+    # When True, parse-only: returns the model counts WITHOUT calling any edge
+    # function (no graph writes, no network).
+    dry_run: bool = False
+
+
 class NotionRequest(BaseModel):
     query: str | None = None         # optional search text; omit for "everything"
     edited_after: str | None = None  # ISO ts; only pages edited at/after this

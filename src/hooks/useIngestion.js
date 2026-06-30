@@ -6,6 +6,7 @@ import {
   ingestStructured,
   ingestWeb,
   ingestConversation,
+  ingestNaluat,
 } from "../lib/ingestionPipeline";
 
 /**
@@ -21,6 +22,7 @@ const SUBMITTERS = {
   structured: ingestStructured,
   web: ingestWeb,
   conversation: ingestConversation,
+  naluat: ingestNaluat,
 };
 
 export default function useIngestion() {

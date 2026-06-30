@@ -8,13 +8,13 @@ frontend: ## Start Vite dev server (React + Three.js)
 	npm run dev
 
 backend: ## Start FastAPI ingestion pipeline
-	cd pipeline && source .venv/bin/activate && uvicorn pipeline.main:app --reload --port 8000
+	cd pipeline && source .venv/bin/activate && uvicorn pipeline.main:app --reload --port 8080
 
 dev: ## Start both frontend and backend in parallel
-	@echo "Starting frontend (port 5173) and backend (port 8000)..."
+	@echo "Starting frontend (port 5173) and backend (port 8080)..."
 	@trap 'kill 0' INT TERM; \
 	(npm run dev) & \
-	(cd pipeline && source .venv/bin/activate && uvicorn pipeline.main:app --reload --port 8000) & \
+	(cd pipeline && source .venv/bin/activate && uvicorn pipeline.main:app --reload --port 8080) & \
 	wait
 
 # ── Setup ────────────────────────────────────────────────────────────
