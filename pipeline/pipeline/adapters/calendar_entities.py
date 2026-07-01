@@ -7,8 +7,9 @@ qualifies), role mailbox → company-only, free-mail → person-only, own domain
 colleague, noise → dropped).
 
 Per event it emits:
-  - one `communication` node, keyed `communication:{tenant}:gcal:{iCalUID}` so the
-    same meeting on every attendee's calendar collapses to one node;
+  - one `communication` node, keyed `communication:gcal:{iCalUID}` so the
+    same meeting on every attendee's calendar collapses to one node across all
+    firms; the `acl` array carries which tenants/people may see it;
   - `person -attended-> event` for the calendar owner AND every other human
     participant — one symmetric relationship, no owner/attendee distinction;
   - `person -affiliated_with-> company` for participants at a qualifying domain;
@@ -25,6 +26,7 @@ qualifies as a company only via the CRM.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from pipeline.adapters.email_entities import (
@@ -39,18 +41,36 @@ from pipeline.adapters.notes_entities import name_from_email
 if TYPE_CHECKING:
     from pipeline.adapters.calendar import CalendarEvent
 
-
-def event_key(tenant: str, ical_uid: str) -> str:
-    """Canonical key for a calendar meeting node, keyed by its iCalUID. Prefix is
-    `communication:` (the pointer type — calendar meetings are communications);
-    `:gcal:` marks the Google-Calendar source (event_sync discriminates on it)."""
-    return f"communication:{tenant}:gcal:{ical_uid}"
+_GOOGLE_SUFFIX = re.compile(r"@google\.com$")
+_INSTANCE_SUFFIX = re.compile(r"_R\d{8}(T\d{6})?$")
 
 
-def series_key(tenant: str, recurring_event_id: str) -> str:
-    """Canonical key for a recurring-meeting *series* node, keyed by Google's
-    recurringEventId so every occurrence groups under one series."""
-    return f"communication:{tenant}:gcal-series:{recurring_event_id}"
+def _normalize_gcal_id(ical_uid: str) -> str:
+    """Occurrence identity: drop the `@google.com` suffix so the same occurrence
+    keys identically regardless of which extraction produced it. The `_R…`
+    instance suffix is part of an occurrence's identity and is kept."""
+    return _GOOGLE_SUFFIX.sub("", ical_uid or "")
+
+
+def _normalize_series_id(recurring_event_id: str) -> str:
+    """Series identity: drop `@google.com` AND any `_R…` instance suffix — a
+    series parent is one node per recurring meeting, never per occurrence."""
+    return _INSTANCE_SUFFIX.sub("", _GOOGLE_SUFFIX.sub("", recurring_event_id or ""))
+
+
+def event_key(ical_uid: str) -> str:
+    """Firm-neutral canonical key for a calendar meeting node, keyed by its
+    (normalized) iCalUID. One node per real meeting across all firms; the
+    `acl` array carries which tenants/people may see it. `:gcal:` marks the
+    Google-Calendar source (event_sync discriminates on it)."""
+    return f"communication:gcal:{_normalize_gcal_id(ical_uid)}"
+
+
+def series_key(recurring_event_id: str) -> str:
+    """Firm-neutral canonical key for a recurring-meeting *series* node, keyed
+    by Google's (normalized) recurringEventId so every occurrence groups under
+    one series shared across firms."""
+    return f"communication:gcal-series:{_normalize_series_id(recurring_event_id)}"
 
 
 def extract_graph(
@@ -111,7 +131,7 @@ def extract_graph(
 
     for ev in events:
         tenant = ev.tenant_id
-        event_ck = event_key(tenant, ev.ical_uid)
+        event_ck = event_key(ev.ical_uid)
         add_entity(Entity(
             event_ck, "communication", ev.title, occurred_at=ev.start,
             metadata={
@@ -130,7 +150,7 @@ def extract_graph(
         # occurrence stays its own event (distinct iCalUID); the series is a
         # parent the whole recurring meeting hangs off (no attendance of its own).
         if ev.recurring_event_id:
-            series_ck = series_key(tenant, ev.recurring_event_id)
+            series_ck = series_key(ev.recurring_event_id)
             add_entity(Entity(
                 series_ck, "communication", ev.title,
                 metadata={

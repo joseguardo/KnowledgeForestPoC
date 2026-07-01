@@ -684,7 +684,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         for ical_uid in cancelled_ical_uids:
             try:
                 await event_sync.soft_cancel_event(
-                    http, canonical_key=calendar_event_key(firm.tenant_id, ical_uid)
+                    http, canonical_key=calendar_event_key(ical_uid)
                 )
             except AdapterError as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -697,7 +697,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         ev_by_key: dict[str, object] = {}
         for ev in [] if settings.calendar_skip_documents else events:
             if ev.description:
-                ev_by_key.setdefault(calendar_event_key(ev.tenant_id, ev.ical_uid), ev)
+                ev_by_key.setdefault(calendar_event_key(ev.ical_uid), ev)
         for key, ev in ev_by_key.items():
             pid = id_by_key.get(key)
             if not pid:

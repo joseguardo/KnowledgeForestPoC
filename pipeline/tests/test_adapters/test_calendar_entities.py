@@ -46,8 +46,8 @@ def _graph(*events, name_by_email=None):
 def test_builds_event_node_with_metadata():
     g = _graph(_event())
     ents = {e.canonical_key: e for e in g.entities}
-    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
-    assert ev_ck == event_key(TENANT, "uid-1@google.com")
+    ev_ck = event_key("uid-1@google.com")
+    assert ev_ck == "communication:gcal:uid-1"
     ev = ents[ev_ck]
     assert ev.type == "communication"
     assert ev.label == "Sync with Poseidon"
@@ -62,7 +62,7 @@ def test_builds_event_node_with_metadata():
 
 def test_attendance_edges_and_entities():
     g = _graph(_event())
-    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = event_key("uid-1@google.com")
     gp = f"person::gp@kiboventures.com"
     lp = f"person::lp@poseidon.vc"
     company = f"company::{TENANT}::poseidon.vc"
@@ -117,8 +117,8 @@ def test_one_time_event_is_tagged_not_recurring():
 
 def test_recurring_event_tagged_and_linked_to_series():
     g = _graph(_event(ical_uid="uid-A", recurring_event_id="series-xyz"))
-    ev_ck = event_key(TENANT, "uid-A")
-    series_ck = series_key(TENANT, "series-xyz")
+    ev_ck = event_key("uid-A")
+    series_ck = series_key("series-xyz")
 
     ev = next(e for e in g.entities if e.canonical_key == ev_ck)
     assert ev.metadata["is_recurring"] is True
@@ -159,9 +159,22 @@ def test_same_event_on_two_calendars_dedups_by_ical_uid():
     events = [e for e in g.entities if e.type == "communication"]
     assert len(events) == 1
 
-    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = event_key("uid-1@google.com")
     gp = f"person::gp@kiboventures.com"
     lp = f"person::lp@poseidon.vc"
     edges = {(e.source, e.rel, e.target) for e in g.edges}
     assert (gp, "attended", ev_ck) in edges
     assert (lp, "attended", ev_ck) in edges
+
+
+def test_event_key_is_firm_neutral_and_strips_google_suffix():
+    assert event_key("abc123@google.com") == "communication:gcal:abc123"
+    # occurrence iCalUID keeps its _R instance suffix (distinct occurrence identity)
+    assert event_key("abc123_R20260223T150000@google.com") == "communication:gcal:abc123_R20260223T150000"
+
+
+def test_series_key_is_firm_neutral_and_strips_instance_suffix():
+    assert series_key("abc123") == "communication:gcal-series:abc123"
+    # a recurringEventId that leaked an instance suffix must collapse to the bare series id
+    assert series_key("abc123_R20260223T150000") == "communication:gcal-series:abc123"
+    assert series_key("abc123@google.com") == "communication:gcal-series:abc123"
