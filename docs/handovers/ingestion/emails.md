@@ -79,15 +79,14 @@ notes about entities; **was `email_content`, then `communication_content`**).
 The communication node stays firm-wide and subject-free; the
 body behaves like any other document and the content is participant-private.
 
-Access uses **thread membership**, not per-thread access classes:
-- bodies carry one shared sentinel class **`email_body`** (not public, never
-  granted → `can_read_class` returns false for everyone);
-- a **`thread_membership(tenant_id, thread_id, user_id)`** table records the
-  thread's participants who are platform users (mapped via `resolve_user_ids`,
-  written by `add_thread_members`);
-- permissive RLS policies `pointers_read_thread` / `chunks_read_thread` /
-  `edges_read_thread` authorize a body via `can_read_thread(_doc)` (chunks/edges
-  derive `tenant_id`+`thread_id` from their owning document's metadata). Verified:
+Access is the standard per-row `acl uuid[]` model (see
+[access-model.md](../access-model.md)) — the old `email_body` sentinel class +
+`thread_membership` table + `can_read_thread*` policies were **dropped** (Stage 4):
+- the body document (+ its chunks) is written with **`principals = member_uids`** —
+  the thread's participants who are platform users (resolved from the message's
+  addresses via `resolve_user_ids`). That list becomes the row's `acl`;
+- the standard `acl && my_principals()` RLS then authorizes exactly those users;
+- an empty participant list ⇒ `acl=[]` ⇒ visible to no one (fail-closed). Verified:
   a member sees the doc+chunks, a non-member and anon see nothing.
 
 Dedup/idempotency: the doc is content-hash keyed (tenant-namespaced), and the
@@ -188,8 +187,9 @@ select metadata->>'direction', count(*) from pointers
 where type='communication' and metadata->>'event_type'='email' group by 1;
 -- private bodies linked to their communications
 select count(*) from edges where relationship_type='content_of';
--- thread participants who can read bodies
-select count(*) from thread_membership;
+-- private bodies are scoped to their participants (acl = member uids, not public)
+select count(*) from pointers where type='document'
+  and not acl && array['00000000-0000-0000-0000-000000000001'::uuid];
 -- companies / affiliations
 select count(*) from pointers where type='company';
 select count(*) from edges where relationship_type='affiliated_with';

@@ -11,7 +11,7 @@ Every adapter normalizes to `NormalizedItem` (`pipeline/pipeline/models.py`) —
 
 | Table | Role | Key fields |
 |---|---|---|
-| `pointers` | nodes | `type` (company/person/event/document/…), `canonical_key` (unique = identity), `label`, `occurred_at`, `access_class_id` |
+| `pointers` | nodes | `type` (company/person/communication/document/event/…), `canonical_key` (unique = identity), `label`, `occurred_at`, `acl uuid[]` |
 | `edges` | relationships | `source_id`, `target_id`, `relationship_type`, `why`, `weight`; unique `(source,target,type)` |
 | `attributes_kv` | facts | `(pointer_id, key)` unique → upsert; `value`, `data_type` |
 | `document_chunks` | bodies | `(pointer_id, sequence)`; per-chunk embedding + access |
@@ -34,8 +34,8 @@ ids, public sentinel) that may read it — and RLS is `acl && (select
 my_principals())`. People are one **global** `person::{email}` node across firms;
 each firm's ingest unions its tenant into the node's acl, while edges/attributes
 stay per-tenant. See [access-model.md](../access-model.md). (The legacy
-`access_class_id`/`can_read_class`/`thread_membership` are superseded, pending a
-cleanup migration.)
+`access_class_id`/`can_read_class`/`thread_membership` mechanisms were **dropped**
+in Stage 4, migration `20260625170000_drop_legacy_access_model.sql`.)
 
 ## Sources
 

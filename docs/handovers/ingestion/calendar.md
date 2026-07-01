@@ -63,15 +63,16 @@ events. Pages on `nextPageToken`.
   count; an external organizer does).
 
 **Extract** (`calendar_entities.extract_graph`), per event:
-- **event** node, keyed **`event:{tenant}:gcal:{iCalUID}`**. Because `iCalUID` is
+- **communication** node (`type=communication`, `event_type:"meeting"`; was `event`),
+  keyed **`communication:{tenant}:gcal:{iCalUID}`**. Because `iCalUID` is
   stable across every attendee's copy of a meeting, the same meeting read from N
   calendars **collapses to one node** (edges accumulate). `occurred_at` = start;
   metadata = `{event_type:"meeting", location, end, organizer_email, provider,
   calendar_email, is_recurring, series_id}`.
 - **recurring meetings**: an occurrence with a `recurringEventId` is tagged
   (`is_recurring=true`, `series_id`) and linked `event -instance_of-> series`,
-  where the **series** node is keyed `event:{tenant}:gcal-series:{recurringEventId}`
-  (type `event`, `event_type:"meeting_series"`, no attendance of its own). All
+  where the **series** node is keyed `communication:{tenant}:gcal-series:{recurringEventId}`
+  (type `communication`, `event_type:"meeting_series"`, no attendance of its own). All
   occurrences of one series share it; one-offs have `is_recurring=false` and no
   series node. Note distinct series can share a title — grouping is by
   recurringEventId, not name.
@@ -107,7 +108,7 @@ upsert).
   tests/test_adapters/test_calendar_entities.py
   tests/test_adapters/test_calendar_ingest.py`.
 - Live smoke: `POST /api/v1/ingest/calendar {"subject":"<mailbox>","max_results":10}`
-  → `event` pointers + `attended`/`attended_by` edges at `firm:{tenant}`.
+  → `communication` pointers + `attended` edges (symmetric — no `attended_by`) at `firm:{tenant}`.
 - Read-back: `get_person_calendar(<person_id>)` returns the meetings with
   co-attendees.
 - Incremental: re-run with `{"subject":"…","since_last":true}` → cursor advances,
@@ -165,8 +166,9 @@ service-role key. → No new edge functions, no new RPCs, no `overwrite` flag.
 
 **New surface — `pipeline/pipeline/supabase_rest.py`** (thin, logic-free PostgREST
 passthroughs, generalising the inline httpx pattern in `connector_state.py`):
-- `select_pointers(filters)` — e.g. `type=eq.event`, `acl=cs.{tenant_uuid}`,
-  `occurred_at=gte/lte` (backs notes matching + move/cancel existence checks).
+- `select_pointers(filters)` — e.g. `type=eq.communication`, `acl=cs.{tenant_uuid}`,
+  `occurred_at=gte/lte` (backs notes→calendar matching + move/cancel existence checks;
+  the orphan-note absorb path instead queries `type=eq.event`, the notes-side marker).
 - `patch_pointer(id, fields)` — move/retitle, soft-cancel.
 - `select_edges` / `patch_edges` / `delete_edges` — e.g.
   `target_id=eq.X&relationship_type=eq.attended&payload->>source=eq.calendar`.
@@ -187,7 +189,8 @@ Node/document creation still uses the existing `insert_pointer` / `ingest_docume
   - **absorb** — for new events, `select_pointers` same-hour; re-point an orphan
     note-event's doc edge (`patch_edges`) and delete it.
 - `adapters/notes_entities.py` / `api/ingest.py` (notes): before creating a note event,
-  `select_pointers(type=event, acl=tenant, occurred_at in containing hour)` + normalized-title
+  `select_pointers(type=communication, acl=tenant, occurred_at in containing hour)` — i.e.
+  look for an existing **calendar meeting** (keyed `…:gcal:…`) — + normalized-title
   match **in Python** → resolve exactly one `pointer_id`. On match, `ingest_document(link=
   {"target_id": pointer_id, "relationship_type":"content_of"})` + extra attendees
   (`payload.source="notes"`) + `about`; **no new event node**. On no match, create as today.

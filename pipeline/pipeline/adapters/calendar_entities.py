@@ -7,8 +7,8 @@ qualifies), role mailbox → company-only, free-mail → person-only, own domain
 colleague, noise → dropped).
 
 Per event it emits:
-  - one `event` node, keyed `event:{tenant}:gcal:{iCalUID}` so the same meeting on
-    every attendee's calendar collapses to one node;
+  - one `communication` node, keyed `communication:{tenant}:gcal:{iCalUID}` so the
+    same meeting on every attendee's calendar collapses to one node;
   - `person -attended-> event` for the calendar owner AND every other human
     participant — one symmetric relationship, no owner/attendee distinction;
   - `person -affiliated_with-> company` for participants at a qualifying domain;
@@ -41,14 +41,16 @@ if TYPE_CHECKING:
 
 
 def event_key(tenant: str, ical_uid: str) -> str:
-    """Canonical key for a calendar event node, keyed by its iCalUID."""
-    return f"event:{tenant}:gcal:{ical_uid}"
+    """Canonical key for a calendar meeting node, keyed by its iCalUID. Prefix is
+    `communication:` (the pointer type — calendar meetings are communications);
+    `:gcal:` marks the Google-Calendar source (event_sync discriminates on it)."""
+    return f"communication:{tenant}:gcal:{ical_uid}"
 
 
 def series_key(tenant: str, recurring_event_id: str) -> str:
     """Canonical key for a recurring-meeting *series* node, keyed by Google's
     recurringEventId so every occurrence groups under one series."""
-    return f"event:{tenant}:gcal-series:{recurring_event_id}"
+    return f"communication:{tenant}:gcal-series:{recurring_event_id}"
 
 
 def extract_graph(

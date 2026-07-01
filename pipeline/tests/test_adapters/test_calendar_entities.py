@@ -46,7 +46,7 @@ def _graph(*events, name_by_email=None):
 def test_builds_event_node_with_metadata():
     g = _graph(_event())
     ents = {e.canonical_key: e for e in g.entities}
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
     assert ev_ck == event_key(TENANT, "uid-1@google.com")
     ev = ents[ev_ck]
     assert ev.type == "communication"
@@ -62,7 +62,7 @@ def test_builds_event_node_with_metadata():
 
 def test_attendance_edges_and_entities():
     g = _graph(_event())
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
     gp = f"person::gp@kiboventures.com"
     lp = f"person::lp@poseidon.vc"
     company = f"company::{TENANT}::poseidon.vc"
@@ -159,7 +159,7 @@ def test_same_event_on_two_calendars_dedups_by_ical_uid():
     events = [e for e in g.entities if e.type == "communication"]
     assert len(events) == 1
 
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = f"communication:{TENANT}:gcal:uid-1@google.com"
     gp = f"person::gp@kiboventures.com"
     lp = f"person::lp@poseidon.vc"
     edges = {(e.source, e.rel, e.target) for e in g.edges}

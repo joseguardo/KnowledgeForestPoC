@@ -53,8 +53,8 @@ def test_person_key_prefers_email_else_id():
 
 def test_event_key_uses_source_event_id():
     # meetings are now `communication` nodes (event_key is a back-compat alias)
-    assert event_key(TENANT, "evt-9") == f"communication::{TENANT}::affinidad::evt-9"
-    assert communication_key(TENANT, "evt-9") == f"communication::{TENANT}::affinidad::evt-9"
+    assert event_key(TENANT, "evt-9") == f"communication::{TENANT}::afinidad::evt-9"
+    assert communication_key(TENANT, "evt-9") == f"communication::{TENANT}::afinidad::evt-9"
 
 
 def test_opportunity_key_is_id_scoped():
