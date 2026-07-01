@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pipeline import event_sync
+from pipeline.supabase_rest import select_pointers
 
 
 def _http(get_rows=None) -> AsyncMock:
@@ -184,3 +185,50 @@ async def test_absorb_note_events_repoints_orphan_and_deletes_it():
     http.delete.assert_awaited_once()
     _, dkw = http.delete.call_args
     assert ("id", "eq.note1") in list(dkw["params"])
+
+
+# --- cross-tenant convergence regression ---
+
+@pytest.mark.asyncio
+async def test_shared_calendar_node_visible_to_both_tenants():
+    """A firm-neutral calendar node whose acl contains two tenant UUIDs must be
+    discoverable via select_pointers when scoping by EITHER tenant.
+
+    Regression: if select_pointers stopped emitting the acl=cs.{tenant} filter
+    (e.g. the tenant_id branch was accidentally removed) the filter that guards
+    cross-tenant isolation would silently disappear.  This test proves both that
+    the filter is present in the outgoing request AND that the node is returned.
+    """
+    tenant_a = "baa52eca-4c88-4861-9d45-720e743febb4"
+    tenant_b = "ca61f0e5-563e-5894-954f-38f5a9e0eabc"
+    node = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "canonical_key": "communication:gcal:abc123",
+        "type": "communication",
+        "acl": [tenant_a, tenant_b],
+        "occurred_at": "2026-02-02T15:00:00+00:00",
+    }
+
+    # Each call gets its own mock so call_args is unambiguous.
+    http_a = _http(get_rows=[node])
+    http_b = _http(get_rows=[node])
+
+    rows_a = await select_pointers(http_a, ptype="communication", tenant_id=tenant_a)
+    rows_b = await select_pointers(http_b, ptype="communication", tenant_id=tenant_b)
+
+    # The node is returned for both tenants.
+    assert rows_a == [node], "shared node not visible to tenant_a"
+    assert rows_b == [node], "shared node not visible to tenant_b"
+
+    # The outgoing request must carry the acl containment filter for each tenant.
+    params_a = list(http_a.get.call_args.kwargs["params"])
+    params_b = list(http_b.get.call_args.kwargs["params"])
+    assert ("acl", f"cs.{{{tenant_a}}}") in params_a, (
+        f"acl filter missing for tenant_a; got {params_a}"
+    )
+    assert ("acl", f"cs.{{{tenant_b}}}") in params_b, (
+        f"acl filter missing for tenant_b; got {params_b}"
+    )
+    # type filter is also present for both.
+    assert ("type", "eq.communication") in params_a
+    assert ("type", "eq.communication") in params_b
