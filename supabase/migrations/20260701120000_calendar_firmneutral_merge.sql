@@ -49,21 +49,35 @@ update pointers s set
 from (select distinct survivor from cal_map) d
 where s.id = d.survivor;
 
--- 4a. Pre-dedupe child tables with a UNIQUE(pointer_id, key/sequence): drop the
--- loser row wherever the survivor already carries the same key, so the re-point
--- in 4b cannot raise a unique violation and abort the whole migration. These
--- tables are empty for calendar pointers today, but the notes/CRM convergence
--- design attaches attributes/chunks/history onto calendar meetings — and the
--- merge groups are the same meeting across firms, the exact same-key scenario.
-delete from attributes_kv a using cal_map m, attributes_kv s
- where a.pointer_id=m.loser and m.loser<>m.survivor
-   and s.pointer_id=m.survivor and s.key=a.key;
-delete from document_chunks d using cal_map m, document_chunks s
- where d.pointer_id=m.loser and m.loser<>m.survivor
-   and s.pointer_id=m.survivor and s.sequence=d.sequence;
-delete from attribute_history h using cal_map m, attribute_history s
- where h.pointer_id=m.loser and m.loser<>m.survivor and h.valid_to is null
-   and s.pointer_id=m.survivor and s.valid_to is null and s.key=h.key;
+-- 4a. Pre-dedupe child tables with a UNIQUE(pointer_id, key/sequence): within
+-- each merge group (a survivor and all its losers) keep exactly ONE row per key
+-- — the survivor's if present, else the lowest-pointer loser's — and drop the
+-- rest, so the re-point in 4b cannot raise a unique violation and abort the
+-- whole migration. Ranking across the whole group (not just loser-vs-survivor)
+-- also covers the loser-vs-loser case. These tables are empty for calendar
+-- pointers today, but the notes/CRM convergence design attaches attributes/
+-- chunks/history onto calendar meetings — the same meeting across firms, the
+-- exact same-key scenario. Join on cal_map.loser (which includes the survivor's
+-- own self-row) so the survivor participates in the ranking.
+delete from attributes_kv x using (
+  select a.ctid,
+         row_number() over (partition by m.survivor, a.key
+                            order by (a.pointer_id = m.survivor) desc, a.pointer_id) rn
+  from attributes_kv a join cal_map m on m.loser = a.pointer_id
+) d where x.ctid = d.ctid and d.rn > 1;
+delete from document_chunks x using (
+  select c.ctid,
+         row_number() over (partition by m.survivor, c.sequence
+                            order by (c.pointer_id = m.survivor) desc, c.pointer_id) rn
+  from document_chunks c join cal_map m on m.loser = c.pointer_id
+) d where x.ctid = d.ctid and d.rn > 1;
+delete from attribute_history x using (
+  select h.ctid,
+         row_number() over (partition by m.survivor, h.key
+                            order by (h.pointer_id = m.survivor) desc, h.pointer_id) rn
+  from attribute_history h join cal_map m on m.loser = h.pointer_id
+  where h.valid_to is null
+) d where x.ctid = d.ctid and d.rn > 1;
 
 -- 4b. Re-point every FK table from loser -> survivor (survivor rows skip self).
 update edges e set source_id=m.survivor from cal_map m where e.source_id=m.loser and m.loser<>m.survivor;
