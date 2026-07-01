@@ -64,18 +64,33 @@ events. Pages on `nextPageToken`.
 
 **Extract** (`calendar_entities.extract_graph`), per event:
 - **communication** node (`type=communication`, `event_type:"meeting"`; was `event`),
-  keyed **`communication:{tenant}:gcal:{iCalUID}`**. Because `iCalUID` is
-  stable across every attendee's copy of a meeting, the same meeting read from N
-  calendars **collapses to one node** (edges accumulate). `occurred_at` = start;
+  keyed **`communication:gcal:{iCalUID}`** — **firm-neutral, no tenant segment**
+  (the iCalUID is normalized: a trailing `@google.com` is stripped; the `_R…`
+  occurrence-instance suffix is kept). Because `iCalUID` is stable across every
+  attendee's copy of a meeting, the same meeting read from N calendars **collapses
+  to one node across ALL firms** (edges accumulate). Multi-firm visibility rides
+  on the `acl` array: a meeting attended by both firms carries **both tenant UUIDs
+  in its acl** (unioned on each firm's ingest), so `acl @> '{tenant}'` scoping
+  still surfaces it for either firm — the same model persons already use
+  (`person::{email}`). This replaced the old per-firm `communication:{tenant}:gcal:…`
+  keying, which minted a duplicate node per firm; see the migration
+  `supabase/migrations/20260701120000_calendar_firmneutral_merge.sql`. `occurred_at` = start;
   metadata = `{event_type:"meeting", location, end, organizer_email, provider,
   calendar_email, is_recurring, series_id}`.
 - **recurring meetings**: an occurrence with a `recurringEventId` is tagged
   (`is_recurring=true`, `series_id`) and linked `event -instance_of-> series`,
-  where the **series** node is keyed `communication:{tenant}:gcal-series:{recurringEventId}`
-  (type `communication`, `event_type:"meeting_series"`, no attendance of its own). All
-  occurrences of one series share it; one-offs have `is_recurring=false` and no
-  series node. Note distinct series can share a title — grouping is by
-  recurringEventId, not name.
+  where the **series** node is keyed `communication:gcal-series:{recurringEventId}`
+  (firm-neutral, like the meeting key; the recurringEventId is normalized so a
+  series id can **never** carry an `_R…` occurrence suffix — that earlier bug
+  minted one bogus "series" per occurrence). Type `communication`,
+  `event_type:"meeting_series"`, no attendance of its own. All occurrences of one
+  series share it; one-offs have `is_recurring=false` and no series node. Note
+  distinct series can share a title — grouping is by recurringEventId, not name.
+
+> **Follow-up (not done):** companies are still tenant-scoped
+> (`company::{tenant}::{domain}`) and duplicate across firms the same way meetings
+> used to. If that becomes a problem, apply the identical firm-neutral-key +
+> acl-union treatment.
 - **person** per participant, keyed `person::{email}` (global, cross-firm). Name
   resolution (Google usually omits attendee displayName): the provided displayName,
   else the graph person directory `_load_person_names` (email→name from existing
