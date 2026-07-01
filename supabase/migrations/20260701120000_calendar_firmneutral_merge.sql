@@ -100,63 +100,67 @@ delete from tenant_coaccess t using cal_map m
  where m.loser<>m.survivor and (t.pointer_a=m.loser or t.pointer_b=m.loser);
 
 -- 5. Edges: remap loser endpoints to survivors AND dedupe the resulting
---    (source_id,target_id,relationship_type) collisions IN ONE PASS, to respect
---    the UNIQUE index idx_edges_unique_pair. A plain re-point would violate that
---    index the instant e.g. a person's "attended" edge to both firms' copies of
---    a meeting both resolve to the survivor. Effective endpoints never contain a
---    loser id (always coalesced to the survivor), so the final remap of keepers
---    cannot collide.
--- effective endpoints per edge (only edges touching a loser get remapped)
-create temp table edge_eff on commit drop as
+--    (source_id,target_id,relationship_type) collisions, respecting the UNIQUE
+--    index idx_edges_unique_pair. A plain re-point would violate that index the
+--    instant e.g. a person's "attended" edge to both firms' copies of a meeting
+--    both resolve to the survivor. Scoped to ONLY the edges that touch a loser
+--    (~thousands, not the whole ~120k table) so it runs fast in one transaction.
+
+-- 5.1 The affected edges (a loser as source and/or target) with their effective
+-- endpoints (loser -> survivor). Effective endpoints never contain a loser id.
+create temp table edge_fix on commit drop as
 select e.id, e.acl, e.created_at, e.relationship_type,
        coalesce(ms.survivor, e.source_id) as eff_source,
-       coalesce(mt.survivor, e.target_id) as eff_target,
-       (ms.survivor is not null or mt.survivor is not null) as remapped
+       coalesce(mt.survivor, e.target_id) as eff_target
 from edges e
 left join cal_map ms on ms.loser=e.source_id and ms.loser<>ms.survivor
-left join cal_map mt on mt.loser=e.target_id and mt.loser<>mt.survivor;
-create index edge_eff_grp_idx on edge_eff(eff_source, eff_target, relationship_type);
+left join cal_map mt on mt.loser=e.target_id and mt.loser<>mt.survivor
+where ms.survivor is not null or mt.survivor is not null;
 
--- one keeper per effective (source,target,rel) group (earliest; stable on id)
-create temp table edge_keep on commit drop as
+-- 5.2 All edges that will occupy an affected effective key: the affected edges
+-- themselves (movers) plus any pre-existing edge already sitting at that key
+-- (there is at most one such, by the unique index; it is never itself a mover
+-- because its endpoints are non-loser).
+create temp table edge_occ on commit drop as
+select ef.eff_source, ef.eff_target, ef.relationship_type, ef.id, ef.acl, ef.created_at, false as is_existing
+from edge_fix ef
+union all
+select k.eff_source, k.eff_target, k.relationship_type, x.id, x.acl, x.created_at, true
+from (select distinct eff_source, eff_target, relationship_type from edge_fix) k
+join edges x on x.source_id=k.eff_source and x.target_id=k.eff_target and x.relationship_type=k.relationship_type;
+create index edge_occ_grp_idx on edge_occ(eff_source, eff_target, relationship_type);
+
+-- 5.3 Winner per effective key: a pre-existing edge wins (stays put); else the
+-- earliest mover. And the unioned acl of every occupant of that key.
+create temp table edge_win on commit drop as
 select distinct on (eff_source, eff_target, relationship_type)
-       id as keep_id, eff_source, eff_target, relationship_type
-from edge_eff
-order by eff_source, eff_target, relationship_type, created_at, id;
-create index edge_keep_id_idx on edge_keep(keep_id);
-create index edge_keep_grp_idx on edge_keep(eff_source, eff_target, relationship_type);
+       eff_source, eff_target, relationship_type, id as winner_id, is_existing as winner_existing
+from edge_occ
+order by eff_source, eff_target, relationship_type, is_existing desc, created_at, id;
+create index edge_win_id_idx on edge_win(winner_id);
 
--- effective groups that actually contain >1 edge (i.e. a merge happened) — the
--- only ones whose keeper needs an acl re-union or has non-keepers to delete.
-create temp table edge_dupgrp on commit drop as
-select eff_source, eff_target, relationship_type
-from edge_eff group by 1,2,3 having count(*)>1;
-create index edge_dupgrp_idx on edge_dupgrp(eff_source, eff_target, relationship_type);
+create temp table edge_acl on commit drop as
+select eff_source, eff_target, relationship_type, array_agg(distinct u) as macl
+from edge_occ o, lateral unnest(coalesce(o.acl,'{}'::uuid[])) u
+group by eff_source, eff_target, relationship_type;
 
--- union every group member's acl into its keeper (dup groups only)
-update edges e set acl = coalesce((
-  select array_agg(distinct u)
-  from edge_eff ee, lateral unnest(coalesce(ee.acl,'{}'::uuid[])) u
-  where ee.eff_source=k.eff_source and ee.eff_target=k.eff_target
-    and ee.relationship_type=k.relationship_type), '{}'::uuid[])
-from edge_keep k
-join edge_dupgrp g on g.eff_source=k.eff_source and g.eff_target=k.eff_target
-                  and g.relationship_type=k.relationship_type
-where e.id=k.keep_id;
+-- 5.4 Set the winner's acl to the merged union.
+update edges e set acl = a.macl
+from edge_win w
+join edge_acl a on a.eff_source=w.eff_source and a.eff_target=w.eff_target and a.relationship_type=w.relationship_type
+where e.id=w.winner_id;
 
--- delete every non-keeper (the duplicates the remap would otherwise create).
--- Must NOT restrict to remapped edges: if a remapped edge is its group's keeper
--- (earlier created_at), a non-remapped member becomes the non-keeper and must be
--- removed too, else the keeper's remap collides with it. Indexed not-exists keeps
--- this cheap despite scanning all edges.
-delete from edges e
- where not exists (select 1 from edge_keep k where k.keep_id=e.id);
+-- 5.5 Delete the non-winner occupants (redundant per-tenant edge copies; their
+-- acl was folded into the winner in 5.4). Only movers can be non-winners.
+delete from edges e using edge_occ o
+ where e.id=o.id and not exists (select 1 from edge_win w where w.winner_id=e.id);
 
--- remap the surviving keepers to their effective endpoints (now collision-free)
-update edges e set source_id=k.eff_source, target_id=k.eff_target
-from edge_keep k
-where e.id=k.keep_id
-  and (e.source_id<>k.eff_source or e.target_id<>k.eff_target);
+-- 5.6 If the winner is a mover (no pre-existing edge at the key), remap it to the
+-- effective endpoints. Now collision-free: non-winners at that key are gone.
+update edges e set source_id=w.eff_source, target_id=w.eff_target
+from edge_win w
+where e.id=w.winner_id and not w.winner_existing
+  and (e.source_id<>w.eff_source or e.target_id<>w.eff_target);
 
 -- (duplicate_flags / tenant_coaccess loser rows were dropped in step 4c.)
 
