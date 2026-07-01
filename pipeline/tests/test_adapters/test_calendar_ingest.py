@@ -93,7 +93,7 @@ async def test_ingest_calendar_builds_event_graph(async_client, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.json()["source_type"] == "calendar"
 
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = "communication:gcal:uid-1"
     gp = f"person::gp@kiboventures.com"
     lp = f"person::lp@poseidon.vc"
     company = f"company::{TENANT}::poseidon.vc"
@@ -158,7 +158,7 @@ async def test_ingest_calendar_overwrites_and_reconciles_on_merge(async_client, 
     client, _, _ = _wire(
         monkeypatch, events=[_event(start="2026-06-25T13:00:00Z", title="Renamed")]
     )
-    ev_ck = f"event:{TENANT}:gcal:uid-1@google.com"
+    ev_ck = "communication:gcal:uid-1"
 
     async def fake_insert(**kw):
         status = "merged" if kw["type"] == "communication" else "created"
@@ -204,7 +204,7 @@ async def test_ingest_calendar_soft_marks_cancelled(async_client, monkeypatch):
     from pipeline.main import app
 
     client, _, _ = _wire(monkeypatch, events=[], cancelled=["uid-x@google.com"])
-    ev_ck = f"event:{TENANT}:gcal:uid-x@google.com"
+    ev_ck = "communication:gcal:uid-x"
     http = _mock_http(get_rows=[{"id": ev_ck, "metadata": {"event_type": "meeting"}}])
     app.state.http = http
 

@@ -51,9 +51,9 @@ async def test_select_pointers_builds_window_and_tenant_filters():
 @pytest.mark.asyncio
 async def test_select_pointers_by_canonical_key():
     http = _http([])
-    await sr.select_pointers(http, canonical_key="event:T1:gcal:abc")
+    await sr.select_pointers(http, canonical_key="communication:T1:gcal:abc")
     _, kwargs = http.get.call_args
-    assert ("canonical_key", "eq.event:T1:gcal:abc") in _params_list(kwargs)
+    assert ("canonical_key", "eq.communication:T1:gcal:abc") in _params_list(kwargs)
 
 
 @pytest.mark.asyncio

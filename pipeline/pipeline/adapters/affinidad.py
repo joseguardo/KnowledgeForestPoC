@@ -193,7 +193,7 @@ def opportunity_key(tenant: str, entity_id: str) -> str:
 
 
 def communication_key(tenant: str, event_id: str) -> str:
-    return f"communication::{tenant}::affinidad::{event_id}"
+    return f"communication::{tenant}::afinidad::{event_id}"
 
 
 # Back-compat alias (older callers/tests referenced event_key).
@@ -242,7 +242,7 @@ def _as_obj(v: Any) -> Any:
 def _to_entity(tenant: str, row: dict[str, Any], emails: dict[str, list[str]]) -> CrmEntity:
     kind = row.get("kind")
     eid = str(row["id"])
-    meta: dict[str, Any] = {"source": "affinidad", "external_id": eid, "kind": kind}
+    meta: dict[str, Any] = {"source": "afinidad", "external_id": eid, "kind": kind}
     aff = _str(row.get("affinity_id"))
     if aff:
         meta["affinity_id"] = aff
@@ -335,7 +335,7 @@ def _to_event(tenant: str, row: dict[str, Any], participants: list[tuple[str, st
         label = subject or typ.capitalize()
 
     meta: dict[str, Any] = {
-        "source": "affinidad",
+        "source": "afinidad",
         "external_id": _str(row.get("external_id")),
         "event_type": typ,
         "direction": _str(row.get("direction")),

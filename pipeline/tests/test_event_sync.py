@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pipeline import event_sync
+from pipeline.supabase_rest import select_pointers
 
 
 def _http(get_rows=None) -> AsyncMock:
@@ -70,7 +71,7 @@ async def test_overwrite_event_patches_time_title_metadata():
 async def test_soft_cancel_event_marks_and_drops_attendance():
     http = _http(get_rows=[{"id": "ev1", "metadata": {"event_type": "meeting"}}])
     found = await event_sync.soft_cancel_event(
-        http, canonical_key="event:T1:gcal:abc"
+        http, canonical_key="communication:T1:gcal:abc"
     )
     assert found is True
     # Patched metadata: preserves existing keys, adds cancelled status + timestamp.
@@ -91,7 +92,7 @@ async def test_soft_cancel_event_marks_and_drops_attendance():
 async def test_soft_cancel_event_noop_when_never_ingested():
     http = _http(get_rows=[])
     found = await event_sync.soft_cancel_event(
-        http, canonical_key="event:T1:gcal:missing"
+        http, canonical_key="communication:T1:gcal:missing"
     )
     assert found is False
     http.patch.assert_not_called()
@@ -107,8 +108,8 @@ def test_meeting_title_key_normalizes_case_space_punct():
 async def test_find_calendar_event_matches_same_hour_and_title():
     # Two events in the hour; only the gcal one with a matching title is returned.
     http = _http(get_rows=[
-        {"id": "series", "canonical_key": "event:T1:gcal-series:s", "label": "Sync"},
-        {"id": "cal1", "canonical_key": "event:T1:gcal:uid", "label": "Sync with Poseidon"},
+        {"id": "series", "canonical_key": "communication:T1:gcal-series:s", "label": "Sync"},
+        {"id": "cal1", "canonical_key": "communication:T1:gcal:uid", "label": "Sync with Poseidon"},
         {"id": "note1", "canonical_key": "event:T1:meetingnote:pg", "label": "Sync with Poseidon"},
     ])
     pid = await event_sync.find_calendar_event(
@@ -131,7 +132,7 @@ async def test_find_calendar_event_matches_same_hour_and_title():
 async def test_find_calendar_event_day_window_for_date_only():
     # A date-only note matches a same-day calendar event even at a different hour.
     http = _http(get_rows=[
-        {"id": "cal1", "canonical_key": "event:T1:gcal:uid", "label": "Sync with Poseidon"},
+        {"id": "cal1", "canonical_key": "communication:T1:gcal:uid", "label": "Sync with Poseidon"},
     ])
     pid = await event_sync.find_calendar_event(
         http, tenant_id="T1", scheduled_at="2026-06-19T00:00:00+00:00",
@@ -146,7 +147,7 @@ async def test_find_calendar_event_day_window_for_date_only():
 @pytest.mark.asyncio
 async def test_find_calendar_event_none_when_no_title_match():
     http = _http(get_rows=[
-        {"id": "cal1", "canonical_key": "event:T1:gcal:uid", "label": "Different meeting"},
+        {"id": "cal1", "canonical_key": "communication:T1:gcal:uid", "label": "Different meeting"},
     ])
     pid = await event_sync.find_calendar_event(
         http, tenant_id="T1", scheduled_at="2026-06-19T11:00:00Z", title="Sync with Poseidon",
@@ -167,8 +168,8 @@ async def test_find_calendar_event_none_without_scheduled_at():
 @pytest.mark.asyncio
 async def test_absorb_note_events_repoints_orphan_and_deletes_it():
     http = _http(get_rows=[
-        {"id": "cal1", "canonical_key": "event:T1:gcal:uid", "label": "Sync"},        # self
-        {"id": "series", "canonical_key": "event:T1:gcal-series:s", "label": "Sync"}, # calendar series
+        {"id": "cal1", "canonical_key": "communication:T1:gcal:uid", "label": "Sync"},        # self
+        {"id": "series", "canonical_key": "communication:T1:gcal-series:s", "label": "Sync"}, # calendar series
         {"id": "note1", "canonical_key": "event:T1:meetingnote:pg", "label": "Sync"}, # orphan → absorb
         {"id": "note2", "canonical_key": "event:T1:meeting:h", "label": "Other"},     # title mismatch
     ])
@@ -184,3 +185,50 @@ async def test_absorb_note_events_repoints_orphan_and_deletes_it():
     http.delete.assert_awaited_once()
     _, dkw = http.delete.call_args
     assert ("id", "eq.note1") in list(dkw["params"])
+
+
+# --- cross-tenant convergence regression ---
+
+@pytest.mark.asyncio
+async def test_shared_calendar_node_visible_to_both_tenants():
+    """A firm-neutral calendar node whose acl contains two tenant UUIDs must be
+    discoverable via select_pointers when scoping by EITHER tenant.
+
+    Regression: if select_pointers stopped emitting the acl=cs.{tenant} filter
+    (e.g. the tenant_id branch was accidentally removed) the filter that guards
+    cross-tenant isolation would silently disappear.  This test proves both that
+    the filter is present in the outgoing request AND that the node is returned.
+    """
+    tenant_a = "baa52eca-4c88-4861-9d45-720e743febb4"
+    tenant_b = "ca61f0e5-563e-5894-954f-38f5a9e0eabc"
+    node = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "canonical_key": "communication:gcal:abc123",
+        "type": "communication",
+        "acl": [tenant_a, tenant_b],
+        "occurred_at": "2026-02-02T15:00:00+00:00",
+    }
+
+    # Each call gets its own mock so call_args is unambiguous.
+    http_a = _http(get_rows=[node])
+    http_b = _http(get_rows=[node])
+
+    rows_a = await select_pointers(http_a, ptype="communication", tenant_id=tenant_a)
+    rows_b = await select_pointers(http_b, ptype="communication", tenant_id=tenant_b)
+
+    # The node is returned for both tenants.
+    assert rows_a == [node], "shared node not visible to tenant_a"
+    assert rows_b == [node], "shared node not visible to tenant_b"
+
+    # The outgoing request must carry the acl containment filter for each tenant.
+    params_a = list(http_a.get.call_args.kwargs["params"])
+    params_b = list(http_b.get.call_args.kwargs["params"])
+    assert ("acl", f"cs.{{{tenant_a}}}") in params_a, (
+        f"acl filter missing for tenant_a; got {params_a}"
+    )
+    assert ("acl", f"cs.{{{tenant_b}}}") in params_b, (
+        f"acl filter missing for tenant_b; got {params_b}"
+    )
+    # type filter is also present for both.
+    assert ("type", "eq.communication") in params_a
+    assert ("type", "eq.communication") in params_b

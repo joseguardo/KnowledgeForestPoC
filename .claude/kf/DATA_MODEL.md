@@ -28,22 +28,23 @@ commands work against any KnowledgeForest project (original or a duplicate):
 - **pointers** — entities. `id`, `label`, `type` (pointer_type enum),
   `canonical_key` (unique when set — the dedup identity), `metadata` jsonb,
   `embedding` vector(1536), `search_text` tsvector (auto-maintained by trigger),
-  `occurred_at` (domain event time), `access_class_id`.
+  `occurred_at` (domain event time), `acl uuid[]` (GIN-indexed; the read gate).
 - **attributes_kv** — key/value facts on a pointer. `pointer_id`, `key`,
-  `value` jsonb, `data_type`, `sort_order`, `source`, `access_class_id`.
+  `value` jsonb, `data_type`, `sort_order`, `source`, `acl uuid[]`.
   **UNIQUE(pointer_id, key)** → upsert on conflict.
 - **edges** — typed relationships. `source_id`, `target_id`,
-  `relationship_type`, `why`, `payload`, `weight`, `access_class_id`.
+  `relationship_type`, `why`, `payload`, `weight`, `acl uuid[]`.
   **UNIQUE(source_id, target_id, relationship_type)**.
 - **document_chunks** — `pointer_id`, `sequence`, `content`, `heading`,
-  `embedding`, `access_class_id`. **UNIQUE(pointer_id, sequence)**.
+  `embedding`, `acl uuid[]`. **UNIQUE(pointer_id, sequence)**.
 - **timeseries_data** — `pointer_id`, `ts`, `metric_name`, `value` jsonb.
 - **schema_vocabulary** — `term`, `category` ∈ {edge_type, attribute_key,
   pointer_type}, `description`, `embedding`. Drives query planning; keep it
   current when you introduce new edge/attr/type conventions, then re-run
   `backfill-vocab-embeddings`.
-- **access_classes** / **access_grants** / **tenant_members** — security model
-  (below). **tenants** — tenant registry.
+- **tenant_members** (`user_id, tenant_id`) — the authoritative user→tenant map;
+  the only input to `my_principals()` (security model below). **tenants** — tenant
+  registry. (The old `access_classes` / `access_grants` tables were dropped.)
 - Forest (auto-computed, don't hand-edit): `tenant_trees`, `tenant_branches`,
   `tenant_pointer_assignments`, `tenant_coaccess(_cursor)`,
   `tenant_structure_events`, `tenant_structure_mapping`, `naming_cache`,
@@ -55,19 +56,36 @@ commands work against any KnowledgeForest project (original or a duplicate):
 
 - **pointer_type**: company, person, sector, geography, regulation, document,
   timeseries, agent, skill, tool, flow, component, architecture, best_practice,
-  meta, event.
+  meta, communication, message, event. **`communication`** is the current type for
+  meetings (Calendar) and emails (Gmail) and CRM interactions (Affinidad) —
+  `metadata.event_type` names the medium (`meeting`/`email`/…). `event` is now only
+  a **notes-side marker**: a meeting-note that finds no matching calendar
+  `communication` creates its own `event` node, which reconciliation later folds
+  onto the calendar meeting. (`message` is a legacy alias, superseded by
+  `communication`.)
 - **attribute_data_type**: string, number, boolean, json, date, url.
 - **edge relationship_type** (common): primary_sector, ceo, competitor,
   hq_location, jurisdiction, related, part_of, contains, powers, guides,
-  follows, ensures_compliance, uses_skill, uses_tool, uses_agent; calendar:
-  `attended` (person→event), `attended_by` (event→person), `regarding`
-  (event→company); document: `describes`.
+  follows, ensures_compliance, uses_skill, uses_tool, uses_agent. Communications
+  (calendar/email/CRM): `attended` (person→communication, **symmetric** — no
+  `attended_by`), `sent` (person→communication), `received`
+  (communication→person), `affiliated_with` (person→company), `regarding`
+  (communication→company), `about` (communication/event→company), `instance_of`
+  (occurrence→recurring-series). Documents: `content_of` and `attachment`
+  (document→communication) attach an email/meeting body or a file to its
+  communication. (Legacy, no longer written: `attended_by`, `describes`,
+  `event_details`, `meeting_notes`, `email_content` — the last three unified into
+  `content_of`.)
 - **attribute keys** (canonical, from vocabulary): CEO, Rev, HQ, Location,
   Title, Stage, PE, Market, CAGR, GDP, Scope, Enacted, Conf, occurred_at.
 - **canonical_key** (the dedup identity — make it stable & deterministic):
-  documents `doc:<sha256(content)>`; calendar events `event:<owner>:<start>`;
-  entities a stable slug like `company:openai`, `person:jensen-huang`. Omit only
-  if you want pure fuzzy dedup.
+  documents `doc:<sha256(content)>`; calendar meetings
+  `communication:{tenant}:gcal:{iCalUID}` (iCalUID is stable across every
+  attendee's copy, so one meeting = one node); emails `message:{tenant}:gmail:{hash}`;
+  people **global** `person::{email}` (no tenant — same human is one node across
+  firms, acl unions per firm); companies `company::{tenant}::{domain}`; other
+  entities a stable slug like `company:openai`. Omit only if you want pure fuzzy
+  dedup.
 
 ## Dedup (how writes resolve)
 
@@ -94,12 +112,12 @@ Pick by input shape:
   metadata?, chunk_size?, access_class?, link?: { target_id | target_canonical_key
   | target_label, relationship_type?, why? } }`. Chunks on paragraphs, embeds
   each, dedups on content hash, optionally links doc→entity.
-- **ingest-calendar** — meetings/emails. Body: `{ owner: { label, type?,
-  canonical_key? }, events: [{ title, start, end?, location?, notes?,
-  event_type?, from?, canonical_key?, attendees?: [{ label, type? }], company? }],
-  access_class?, source? }`. Creates an `event` pointer per meeting + people/
-  company pointers + attended/attended_by/regarding edges. Defaults to
-  `confidential`.
+- **ingest-calendar** — ⚠️ **deprecated** (no caller remains). Calendar, Gmail and
+  Notes now extract in the pipeline and write through the shared `insert-pointer` +
+  `link-pointers` + `ingest-document` path (deterministic, no bespoke edge
+  function). Each meeting/email becomes a `communication` pointer with
+  `attended`/`sent`/`received`/`regarding` edges and a `content_of` body document.
+  See `docs/handovers/ingestion/{calendar,emails,notes}.md`.
 - **link-pointers** — explicit edge between two existing pointers. Body:
   `{ source_id, target_id, relationship_type?, why?, payload?, weight? }`.
 
@@ -147,13 +165,27 @@ clusters them into trees/branches via union-find + LLM naming. Retrieval's
 co-access layer reflects this. You don't call compute-forest directly; it runs
 on schedule or when the change threshold trips.
 
-## Security (access classes)
+## Security (per-row `acl[]`)
 
-Classes: `public` (id `00000000-0000-0000-0000-000000000001`, readable by all),
-`confidential`, `restricted`. Ingestion stamps a class on the pointer and its
-attributes/chunks/edges. Reads are gated by `can_read_class(access_class_id)`:
-public always; otherwise the caller (`auth.uid()`) needs a direct user grant or
-a grant via a tenant they belong to (`access_grants` + `tenant_members`).
-`query-knowledge` forwards the caller's JWT, so restricted content is filtered
-out of hints, results, AND the composed answer for under-cleared callers. Grant
-management is service_role-only (`access_grants` has no public policy).
+Every gated row (`pointers`, `attributes_kv`, `document_chunks`, `edges`) carries
+`acl uuid[]` — the set of **principals** allowed to read it — and RLS is a single
+array-overlap check: `acl && (select my_principals())`. Principals are tenant ids,
+user ids (`auth.uid()`), and the public sentinel
+`00000000-0000-0000-0000-000000000001`. `my_principals()` returns
+`[public_sentinel] + auth.uid() (if authed) + the caller's tenant ids` (from
+`tenant_members`); anon → `[public_sentinel]` only. **Fail-closed:** `acl` defaults
+to `'{}'`, which overlaps nothing, so a row no writer stamped is visible to **no
+one** (not public) — every write path must set `acl`. Edges additionally require
+both endpoint pointers to be visible.
+
+Writers use `access_class` as the **wire vocabulary** — `public`/null →
+`[public_sentinel]`, `firm:{tenant}` → `[tenant]`, `user:{uid}` → `[uid]`,
+anything else → `[]` — translated to `acl` at the write boundary by
+`principals_for_class`; private bodies pass an explicit `principals: uuid[]`
+instead. The dedup RPC UNIONs the incoming `acl` into an existing row on a merge
+(this is how a global `person::{email}` node accumulates `[kibo, nzyme]`).
+`query-knowledge` forwards the caller's JWT, so out-of-reach content is filtered
+from hints, results, AND the composed answer. **This replaced** the old
+`access_classes` / `access_grants` / `access_class_id` / `can_read_class` /
+`thread_membership` model, all dropped (Stage 4). See
+`docs/handovers/access-model.md`.

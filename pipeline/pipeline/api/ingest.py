@@ -690,7 +690,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         for ical_uid in cancelled_ical_uids:
             try:
                 await event_sync.soft_cancel_event(
-                    http, canonical_key=calendar_event_key(firm.tenant_id, ical_uid)
+                    http, canonical_key=calendar_event_key(ical_uid)
                 )
             except AdapterError as exc:
                 errors.append(_error_from_exc(len(results) + len(errors), exc))
@@ -703,7 +703,7 @@ async def ingest_calendar(body: CalendarRequest, request: Request) -> IngestResp
         ev_by_key: dict[str, object] = {}
         for ev in [] if settings.calendar_skip_documents else events:
             if ev.description:
-                ev_by_key.setdefault(calendar_event_key(ev.tenant_id, ev.ical_uid), ev)
+                ev_by_key.setdefault(calendar_event_key(ev.ical_uid), ev)
         for key, ev in ev_by_key.items():
             pid = id_by_key.get(key)
             if not pid:
@@ -1026,7 +1026,7 @@ _INGEST_ERRORS = (AdapterError, EdgeFunctionError, EdgeFunctionTimeout, Validati
 def _attr_dicts(attrs) -> list[dict]:
     """(key, value, data_type) tuples → insert-pointer/ingest-batch attribute rows."""
     return [
-        {"key": k, "value": v, "data_type": dt, "source": "affinidad"}
+        {"key": k, "value": v, "data_type": dt, "source": "afinidad"}
         for (k, v, dt) in attrs
     ]
 
@@ -1062,7 +1062,7 @@ async def _ingest_crm_edge(
         source_id=src,
         target_id=tgt,
         relationship_type=edge.relation,
-        why=f"{edge.relation} (from Affinidad CRM)",
+        why=f"{edge.relation} (from Afinidad CRM)",
         payload=edge.metadata or None,
         principals=principals,
     )
@@ -1145,7 +1145,7 @@ async def _ingest_crm_note(
         content=note.body,
         occurred_at=note.occurred_at,
         metadata={
-            "source": "affinidad",
+            "source": "afinidad",
             "note_id": note.note_id,
             "visibility": "private" if note.private else "org",
         },
@@ -1227,7 +1227,7 @@ async def _ingest_crm_event(
             title=ev.subject or ev.label,
             content=content,
             occurred_at=ev.occurred_at,
-            metadata={"source": "affinidad", "event_id": ev.event_id, "event_type": ev.type},
+            metadata={"source": "afinidad", "event_id": ev.event_id, "event_type": ev.type},
             principals=body_principals,
             canonical_key_namespace=primary,
             link=link,
@@ -1504,7 +1504,7 @@ async def ingest_affinidad(body: AffinidadRequest, request: Request) -> IngestRe
 
     elapsed = int((time.monotonic() - start) * 1000)
     return IngestResponse(
-        source_type="affinidad",
+        source_type="afinidad",
         items_produced=produced,
         results=results,
         errors=errors,
