@@ -37,6 +37,8 @@ select c.id as loser,
        first_value(c.id) over (partition by c.newkey order by c.created_at, c.id) as survivor,
        c.newkey
 from cal_new c;
+create index cal_map_loser_idx on cal_map(loser);
+create index cal_map_survivor_idx on cal_map(survivor);
 
 -- 3. Union every loser's acl into its survivor.
 update pointers s set
@@ -79,9 +81,8 @@ delete from attribute_history x using (
   where h.valid_to is null
 ) d where x.ctid = d.ctid and d.rn > 1;
 
--- 4b. Re-point every FK table from loser -> survivor (survivor rows skip self).
-update edges e set source_id=m.survivor from cal_map m where e.source_id=m.loser and m.loser<>m.survivor;
-update edges e set target_id=m.survivor from cal_map m where e.target_id=m.loser and m.loser<>m.survivor;
+-- 4b. Re-point the simple FK tables (edges handled separately in step 5 because
+-- of its UNIQUE(source_id,target_id,relationship_type) index).
 update attributes_kv a  set pointer_id=m.survivor from cal_map m where a.pointer_id=m.loser and m.loser<>m.survivor;
 update document_chunks d set pointer_id=m.survivor from cal_map m where d.pointer_id=m.loser and m.loser<>m.survivor;
 update timeseries_data t set pointer_id=m.survivor from cal_map m where t.pointer_id=m.loser and m.loser<>m.survivor;
@@ -98,26 +99,64 @@ delete from duplicate_flags f using cal_map m
 delete from tenant_coaccess t using cal_map m
  where m.loser<>m.survivor and (t.pointer_a=m.loser or t.pointer_b=m.loser);
 
--- 5. Dedupe edges that now collide (union acl into the kept row, drop the rest).
---    An edge is identified by (source_id, target_id, relationship_type).
-with ranked as (
-  select id, source_id, target_id, relationship_type, acl,
-         row_number() over (partition by source_id, target_id, relationship_type order by created_at, id) rn,
-         first_value(id) over (partition by source_id, target_id, relationship_type order by created_at, id) keep_id
-  from edges
-)
-update edges e set acl = (
-  select array(select distinct x from unnest(
-    coalesce(e.acl,'{}'::uuid[]) ||
-    coalesce((select array_agg(y) from ranked r cross join lateral unnest(r.acl) y where r.keep_id=e.id),'{}'::uuid[])) x))
-from ranked k where k.keep_id=e.id and k.rn=1;
+-- 5. Edges: remap loser endpoints to survivors AND dedupe the resulting
+--    (source_id,target_id,relationship_type) collisions IN ONE PASS, to respect
+--    the UNIQUE index idx_edges_unique_pair. A plain re-point would violate that
+--    index the instant e.g. a person's "attended" edge to both firms' copies of
+--    a meeting both resolve to the survivor. Effective endpoints never contain a
+--    loser id (always coalesced to the survivor), so the final remap of keepers
+--    cannot collide.
+-- effective endpoints per edge (only edges touching a loser get remapped)
+create temp table edge_eff on commit drop as
+select e.id, e.acl, e.created_at, e.relationship_type,
+       coalesce(ms.survivor, e.source_id) as eff_source,
+       coalesce(mt.survivor, e.target_id) as eff_target,
+       (ms.survivor is not null or mt.survivor is not null) as remapped
+from edges e
+left join cal_map ms on ms.loser=e.source_id and ms.loser<>ms.survivor
+left join cal_map mt on mt.loser=e.target_id and mt.loser<>mt.survivor;
+create index edge_eff_grp_idx on edge_eff(eff_source, eff_target, relationship_type);
 
-delete from edges e using (
-  select id from (
-    select id, row_number() over (partition by source_id, target_id, relationship_type order by created_at, id) rn
-    from edges
-  ) z where z.rn>1
-) dup where e.id=dup.id;
+-- one keeper per effective (source,target,rel) group (earliest; stable on id)
+create temp table edge_keep on commit drop as
+select distinct on (eff_source, eff_target, relationship_type)
+       id as keep_id, eff_source, eff_target, relationship_type
+from edge_eff
+order by eff_source, eff_target, relationship_type, created_at, id;
+create index edge_keep_id_idx on edge_keep(keep_id);
+create index edge_keep_grp_idx on edge_keep(eff_source, eff_target, relationship_type);
+
+-- effective groups that actually contain >1 edge (i.e. a merge happened) — the
+-- only ones whose keeper needs an acl re-union or has non-keepers to delete.
+create temp table edge_dupgrp on commit drop as
+select eff_source, eff_target, relationship_type
+from edge_eff group by 1,2,3 having count(*)>1;
+create index edge_dupgrp_idx on edge_dupgrp(eff_source, eff_target, relationship_type);
+
+-- union every group member's acl into its keeper (dup groups only)
+update edges e set acl = coalesce((
+  select array_agg(distinct u)
+  from edge_eff ee, lateral unnest(coalesce(ee.acl,'{}'::uuid[])) u
+  where ee.eff_source=k.eff_source and ee.eff_target=k.eff_target
+    and ee.relationship_type=k.relationship_type), '{}'::uuid[])
+from edge_keep k
+join edge_dupgrp g on g.eff_source=k.eff_source and g.eff_target=k.eff_target
+                  and g.relationship_type=k.relationship_type
+where e.id=k.keep_id;
+
+-- delete every non-keeper (the duplicates the remap would otherwise create).
+-- Must NOT restrict to remapped edges: if a remapped edge is its group's keeper
+-- (earlier created_at), a non-remapped member becomes the non-keeper and must be
+-- removed too, else the keeper's remap collides with it. Indexed not-exists keeps
+-- this cheap despite scanning all edges.
+delete from edges e
+ where not exists (select 1 from edge_keep k where k.keep_id=e.id);
+
+-- remap the surviving keepers to their effective endpoints (now collision-free)
+update edges e set source_id=k.eff_source, target_id=k.eff_target
+from edge_keep k
+where e.id=k.keep_id
+  and (e.source_id<>k.eff_source or e.target_id<>k.eff_target);
 
 -- (duplicate_flags / tenant_coaccess loser rows were dropped in step 4c.)
 
