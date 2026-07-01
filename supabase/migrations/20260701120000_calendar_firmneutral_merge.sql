@@ -49,7 +49,23 @@ update pointers s set
 from (select distinct survivor from cal_map) d
 where s.id = d.survivor;
 
--- 4. Re-point every FK table from loser -> survivor (survivor rows skip self).
+-- 4a. Pre-dedupe child tables with a UNIQUE(pointer_id, key/sequence): drop the
+-- loser row wherever the survivor already carries the same key, so the re-point
+-- in 4b cannot raise a unique violation and abort the whole migration. These
+-- tables are empty for calendar pointers today, but the notes/CRM convergence
+-- design attaches attributes/chunks/history onto calendar meetings — and the
+-- merge groups are the same meeting across firms, the exact same-key scenario.
+delete from attributes_kv a using cal_map m, attributes_kv s
+ where a.pointer_id=m.loser and m.loser<>m.survivor
+   and s.pointer_id=m.survivor and s.key=a.key;
+delete from document_chunks d using cal_map m, document_chunks s
+ where d.pointer_id=m.loser and m.loser<>m.survivor
+   and s.pointer_id=m.survivor and s.sequence=d.sequence;
+delete from attribute_history h using cal_map m, attribute_history s
+ where h.pointer_id=m.loser and m.loser<>m.survivor and h.valid_to is null
+   and s.pointer_id=m.survivor and s.valid_to is null and s.key=h.key;
+
+-- 4b. Re-point every FK table from loser -> survivor (survivor rows skip self).
 update edges e set source_id=m.survivor from cal_map m where e.source_id=m.loser and m.loser<>m.survivor;
 update edges e set target_id=m.survivor from cal_map m where e.target_id=m.loser and m.loser<>m.survivor;
 update attributes_kv a  set pointer_id=m.survivor from cal_map m where a.pointer_id=m.loser and m.loser<>m.survivor;
@@ -57,12 +73,16 @@ update document_chunks d set pointer_id=m.survivor from cal_map m where d.pointe
 update timeseries_data t set pointer_id=m.survivor from cal_map m where t.pointer_id=m.loser and m.loser<>m.survivor;
 update attribute_history h set pointer_id=m.survivor from cal_map m where h.pointer_id=m.loser and m.loser<>m.survivor;
 
--- duplicate_flags / tenant_coaccess use a<b column pairs: re-point then let the
--- self/duplicate rows fall out via the dedupe + delete below. Re-point both sides.
-update duplicate_flags f set pointer_id_a=m.survivor from cal_map m where f.pointer_id_a=m.loser and m.loser<>m.survivor;
-update duplicate_flags f set pointer_id_b=m.survivor from cal_map m where f.pointer_id_b=m.loser and m.loser<>m.survivor;
-update tenant_coaccess t set pointer_a=m.survivor from cal_map m where t.pointer_a=m.loser and m.loser<>m.survivor;
-update tenant_coaccess t set pointer_b=m.survivor from cal_map m where t.pointer_b=m.loser and m.loser<>m.survivor;
+-- 4c. duplicate_flags has CHECK(pointer_id_a < pointer_id_b) + a partial UNIQUE,
+-- and tenant_coaccess a UNIQUE(tenant_id, pointer_a, pointer_b); re-pointing a
+-- loser into a survivor can violate the ordering or the unique. A flag/coaccess
+-- row *about a calendar meeting we are actively de-duplicating* carries no value
+-- once merged, so drop any row referencing a loser rather than re-point it.
+-- (Both tables hold zero calendar rows today.)
+delete from duplicate_flags f using cal_map m
+ where m.loser<>m.survivor and (f.pointer_id_a=m.loser or f.pointer_id_b=m.loser);
+delete from tenant_coaccess t using cal_map m
+ where m.loser<>m.survivor and (t.pointer_a=m.loser or t.pointer_b=m.loser);
 
 -- 5. Dedupe edges that now collide (union acl into the kept row, drop the rest).
 --    An edge is identified by (source_id, target_id, relationship_type).
@@ -85,13 +105,7 @@ delete from edges e using (
   ) z where z.rn>1
 ) dup where e.id=dup.id;
 
--- Drop self-referential / now-duplicate duplicate_flags & tenant_coaccess rows.
-delete from duplicate_flags where pointer_id_a = pointer_id_b;
-delete from tenant_coaccess  where pointer_a   = pointer_b;
-delete from duplicate_flags a using duplicate_flags b
-  where a.ctid > b.ctid and a.pointer_id_a=b.pointer_id_a and a.pointer_id_b=b.pointer_id_b;
-delete from tenant_coaccess a using tenant_coaccess b
-  where a.ctid > b.ctid and a.pointer_a=b.pointer_a and a.pointer_b=b.pointer_b;
+-- (duplicate_flags / tenant_coaccess loser rows were dropped in step 4c.)
 
 -- 6. Rewrite survivor keys to the firm-neutral form, then delete losers.
 update pointers s set canonical_key=m.newkey, updated_at=now()
